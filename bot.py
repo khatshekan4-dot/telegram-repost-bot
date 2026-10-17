@@ -8,6 +8,9 @@ import logging
 import tempfile
 import difflib
 import threading
+import csv
+import io
+import copy
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -269,16 +272,22 @@ except ValueError:
     log.warning("OWNER_TELEGRAM_ID عددی نیست؛ پنل مدیریت تا اصلاح متغیر غیرفعال می‌ماند.")
 
 STATE_IO_LOCK = threading.RLock()
-# Protects the in-memory state across the worker and Telegram admin polling thread.
+# قفل مشترک برای تراکنش‌های منطقی state؛ قفل نوشتن فایل به‌تنهایی کافی نیست.
 STATE_LOCK = threading.RLock()
+BOT_VERSION = "5.3"
+CHEAP_CLASSIFIER_ENABLED = os.environ.get("CHEAP_CLASSIFIER_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+CHEAP_CLASSIFIER_MODEL = os.environ.get("CHEAP_CLASSIFIER_MODEL", "openai/gpt-oss-20b").strip()
+TGSTAT_API_TOKEN = os.environ.get("TGSTAT_API_TOKEN", "").strip()
+ALERT_QUEUE_HIGH_WATER = max(10, env_int("ALERT_QUEUE_HIGH_WATER", 80))
+ALERT_NO_POST_HOURS = max(1, env_int("ALERT_NO_POST_HOURS", 6))
 ADMIN_POLL_TIMEOUT_SECONDS = 25
 ADMIN_PAGE_SIZE = 8
-MAX_ADMIN_HISTORY = 100
+MAX_ADMIN_HISTORY = 5000
 MAX_ADMIN_LOGS = 100
 
 HTTP_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (compatible; RaptorNewsBot/5.0; "
+        "Mozilla/5.0 (compatible; RaptorNewsBot/5.3; "
         "+https://t.me/khaatshekaan)"
     )
 }
@@ -766,19 +775,6 @@ def event_key_or_signature(title, body, event_key=""):
 def default_state():
     return {
         "version": 5.3,
-        "_source_metrics": {},
-        "_alert_state": {},
-        "_last_weekly_summary_key": "",
-        "_paused_until": 0,
-        "_pause_until_important": False,
-        "_blocked_keywords": [],
-        "_priority_keywords": [],
-        "_profile": "normal",
-        "_topic_silences": {},
-        "_auto_approve_rules": [],
-        "_source_enabled": {},
-        "_pinned_queue_id": "",
-        "_history_search": {},
         "_source_initialized": {},
         "_recent_titles": [],
         "_recent_events": [],
@@ -844,6 +840,21 @@ def default_state():
             "last_posted_ts": 0,
         },
         "_telegram_update_offset": 0,
+        "_paused_until": 0,
+        "_pause_until_important": False,
+        "_priority_pin_id": "",
+        "_disabled_sources": [],
+        "_source_stats": {},
+        "_source_health": {},
+        "_blocklist_terms": [],
+        "_priority_keywords": [],
+        "_topic_silences": [],
+        "_auto_approve_rules": [],
+        "_rules_gate_enabled": False,
+        "_v53_alerts": {},
+        "_weekly_summary_last_week": "",
+        "_v53_classifier": {"seen": 0, "passed": 0, "rejected": 0, "errors": 0},
+        "_profile": "normal",
     }
 
 
@@ -927,17 +938,15 @@ def load_state():
             pstate.setdefault("last_error", {})
             pstate.setdefault("usage", {"requests": 0, "successes": 0, "errors": 0,
                                          "prompt_tokens": 0, "completion_tokens": 0})
-        # v5.3 additive migration: preserve existing state and queue.
-        for key, value in default_state().items():
-            if key not in base:
-                base[key] = value
-        base["version"] = 5.3
-        for queued_item in base.get("_pending_queue", []):
-            if queued_item.get("delivery_status") == "sending":
-                queued_item["delivery_status"] = "needs_review"
-                queued_item["delivery_error"] = "راه‌اندازی مجدد هنگام وضعیت sending؛ پیش از retry کانال را بررسی کن."
+        # v5.3 state migration: add new control/analytics fields without removing existing news data.
+        v53 = default_state()
+        for key, value in v53.items():
+            if key not in base or not isinstance(base.get(key), type(value)):
+                base[key] = copy.deepcopy(value)
         for channel in settings.get("source_channels", SOURCE_CHANNELS):
-            base.setdefault("_source_enabled", {}).setdefault(channel, True)
+            base["_source_stats"].setdefault(str(channel), {"fetched": 0, "new": 0, "published": 0, "rejected": 0, "errors": 0})
+            base["_source_health"].setdefault(str(channel), {"fail_count": 0, "last_ok_ts": 0, "last_error_ts": 0, "last_error": ""})
+        base["version"] = 5.3
         return base
     except Exception as exc:
         log.exception("خواندن state شکست خورد؛ state خالی ساخته می‌شود: %s", exc)
@@ -946,7 +955,7 @@ def load_state():
 
 def save_state(state):
     """Atomic write protected against simultaneous admin/main-thread saves."""
-    with STATE_IO_LOCK:
+    with STATE_LOCK, STATE_IO_LOCK:
         path = os.path.abspath(STATE_FILE)
         directory = os.path.dirname(path) or "."
         os.makedirs(directory, exist_ok=True)
@@ -1301,11 +1310,6 @@ def apply_queue_diversity_score(state, item):
     # اگر خبر نظامی/ایرانی مهم باشد، تنوع نباید آن را کاملاً عقب بیندازد.
     if safe_bool(item.get("urgent")):
         score += 20
-    item_text = normalize_for_match(str(item.get("title", "")) + " " + str(item.get("body", "")))
-    matched_priority = [word for word in state.get("_priority_keywords", []) if normalize_for_match(word) and normalize_for_match(word) in item_text]
-    if matched_priority:
-        score += min(30, 10 * len(matched_priority))
-        item["priority_keyword_matches"] = matched_priority
 
     item["region"] = region
     item["priority_score"] = score
@@ -1951,12 +1955,18 @@ def validate_ai_items(items, max_items=EVENT_MAX_OUTPUT_ITEMS, state=None):
         news_score = max(0, min(100, safe_int(raw.get("news_score"), 0)))
         # خبرهای زیر حداقل ارزش خبری اصلاً وارد صف نشوند.
         if news_score < MIN_NEWS_SCORE:
+            log.info("خبر به علت ارزش خبری پایین رد تحریریه‌ای شد | score=%s | title=%s", news_score, title[:120])
+            reason = f"امتیاز ارزش خبری {news_score} کمتر از حداقل {MIN_NEWS_SCORE} بود؛ رد نهایی تحریریه‌ای، نه خطای فنی"
             if state is not None:
-                state["_last_editorial_reject_ts"] = now_ts()
-                state["_editorial_reject_count"] = safe_int(state.get("_editorial_reject_count"), 0) + 1
-            log.info("خبر به علت ارزش خبری پایین حذف شد | score=%s | title=%s", news_score, title[:120])
-            if state is not None:
-                record_decision(state, title, "رد‌شده", f"امتیاز ارزش خبری {news_score} کمتر از حداقل {MIN_NEWS_SCORE} بود", news_score)
+                record_decision(state, title, "رد‌شده", reason, news_score)
+            validated.append({
+                "draft_id": safe_int(raw.get("draft_id"), 0), "relevant": False,
+                "duplicate": False, "duplicate_reason": reason, "rejection_reason": "low_news_score",
+                "news_score": news_score, "title": title[:240], "body": "", "event_key": "",
+                "post_indices": [], "media_post_index": 0, "verification": "reported",
+                "urgent": False, "important": False, "needs_editor": False,
+                "style_mode": "brief", "length_class": "brief", "entities": [],
+            })
             continue
 
         event_type = str(raw.get("event_type", "routine")).strip()
@@ -2150,8 +2160,12 @@ def final_editor(state, drafts, source_posts, first_provider):
                     break
             if candidate is None and idx <= len(edited):
                 candidate = edited[idx - 1]
-            if candidate is None or not candidate.get("relevant", False):
+            if candidate is None:
+                # فقط نبود خروجی برای این draft را با نسخه اصلی جبران می‌کنیم؛
+                # veto صریح ویراستار نباید با fallback بی‌اثر شود.
                 merged.append(original)
+                continue
+            if not candidate.get("relevant", False):
                 continue
 
             merged_item = dict(original)
@@ -2298,15 +2312,26 @@ def fetch_channel_posts(channel, state=None):
         resp.raise_for_status()
         posts = extract_telegram_posts_from_html(channel, resp.text)
         if state is not None:
-            runtime = state.setdefault("_runtime", {})
-            runtime["last_source_success_ts"] = now_ts()
-            runtime["last_source_error"] = ""
+            with STATE_LOCK:
+                runtime = state.setdefault("_runtime", {})
+                runtime["last_source_success_ts"] = now_ts()
+                runtime["last_source_error"] = ""
+                health = state.setdefault("_source_health", {}).setdefault(channel, {"fail_count": 0, "last_ok_ts": 0, "last_error_ts": 0, "last_error": ""})
+                health.update({"fail_count": 0, "last_ok_ts": now_ts(), "last_error": ""})
         return posts
     except Exception as exc:
         log.warning("خطا در گرفتن کانال %s: %s", channel, sanitize_error_text(exc))
         if state is not None:
-            state.setdefault("_runtime", {})["last_source_error"] = sanitize_error_text(exc)
-            record_system_error(state, "Source", f"@{channel}", exc)
+            with STATE_LOCK:
+                state.setdefault("_runtime", {})["last_source_error"] = sanitize_error_text(exc)
+                health = state.setdefault("_source_health", {}).setdefault(channel, {"fail_count": 0, "last_ok_ts": 0, "last_error_ts": 0, "last_error": ""})
+                health["fail_count"] = safe_int(health.get("fail_count"), 0) + 1
+                health["last_error_ts"] = now_ts()
+                health["last_error"] = sanitize_error_text(exc)[:220]
+                stat = state.setdefault("_source_stats", {}).setdefault(channel, {"fetched": 0, "new": 0, "published": 0, "rejected": 0, "errors": 0})
+                stat["errors"] = safe_int(stat.get("errors"), 0) + 1
+                record_system_error(state, "Source", f"@{channel}", exc)
+                save_state(state)
         return []
 
 
@@ -2484,22 +2509,34 @@ class TelegramAPIError(RuntimeError):
         self.status_code = status_code
         self.description = description
         self.retry_after = retry_after
+        # 5xx/timeout-like HTTP responses can happen after Telegram accepted a send.
+        self.delivery_uncertain = (safe_int(status_code, 0) >= 500 or safe_int(status_code, 0) == 408)
+
+
+class TelegramTransportError(RuntimeError):
+    """Network failure after a Telegram send was attempted; result may be unknown."""
 
 
 def telegram_request(method, data=None, files=None, timeout=30):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
 
-    response = requests.post(
-        url,
-        data=data,
-        files=files,
-        timeout=timeout,
-    )
+    try:
+        response = requests.post(
+            url,
+            data=data,
+            files=files,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        raise TelegramTransportError(sanitize_error_text(exc)) from exc
 
     try:
         payload = response.json()
     except ValueError:
         payload = {}
+
+    if response.ok and (not isinstance(payload, dict) or "ok" not in payload):
+        raise TelegramTransportError("Telegram returned a malformed success response; delivery status is uncertain.")
 
     if response.status_code == 429:
         retry_after = (
@@ -2522,17 +2559,18 @@ def telegram_request(method, data=None, files=None, timeout=30):
     return payload
 
 
-def send_text_to_telegram(text):
-    """ارسال متن با قطعه‌بندی امن زیر سقف تلگرام؛ footer فقط یک‌بار در انتها می‌آید."""
+def _utf16_len(value):
+    return len(str(value or "").encode("utf-16-le")) // 2
+
+
+def send_text_to_telegram(text, bold_prefix_len=0):
+    """ارسال قطعه‌بندی‌شده؛ تیتر پیام اول با MessageEntity به‌صورت Bold نمایش داده می‌شود."""
     text = (text or "").strip()
     if not text:
         return None
-
-    # برای حاشیه امن از 4000 کاراکتر استفاده می‌کنیم، نه سقف کامل 4096.
     MAX_TEXT_CHARS = 4000
     chunks = []
     remaining = text
-
     while len(remaining) > MAX_TEXT_CHARS:
         part = truncate_text(remaining, MAX_TEXT_CHARS)
         cut_len = len(part.rstrip("…"))
@@ -2541,56 +2579,69 @@ def send_text_to_telegram(text):
             part = remaining[:cut_len]
         chunks.append(part.rstrip())
         remaining = remaining[cut_len:].lstrip()
-
     if remaining:
         chunks.append(remaining)
-
     result = None
-    for chunk in chunks:
-        payload = {
-            "chat_id": TARGET_CHAT_ID,
-            "text": chunk,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False,
-        }
+    all_message_ids = []
+    for index, chunk in enumerate(chunks):
+        payload = {"chat_id": TARGET_CHAT_ID, "text": chunk, "disable_web_page_preview": False}
+        if index == 0 and safe_int(bold_prefix_len, 0) > 0:
+            payload["entities"] = json.dumps([{"type": "bold", "offset": 0, "length": min(_utf16_len(chunk[:bold_prefix_len]), _utf16_len(chunk))}])
         try:
             result = telegram_request("sendMessage", data=payload, timeout=30)
-        except TelegramAPIError as exc:
-            if exc.status_code == 429:
-                log.warning(
-                    "Telegram rate limit؛ %s ثانیه صبر می‌کنیم.",
-                    exc.retry_after,
-                )
-                time.sleep(exc.retry_after)
-                result = telegram_request("sendMessage", data=payload, timeout=30)
-            else:
-                raise
+        except Exception as exc:
+            try:
+                setattr(exc, "partial_message_ids", all_message_ids)
+            except Exception:
+                pass
+            raise
+        mid = telegram_result_message_id(result)
+        if mid:
+            all_message_ids.append(mid)
+    if isinstance(result, dict):
+        result["_all_message_ids"] = all_message_ids
     return result
 
 def build_media_caption(title, body, max_chars=1024):
-    """Build a valid HTML caption with a bold, safely escaped headline."""
-    raw_title = normalize_space(title)
-    raw_body = (body or "").strip()
+    """
+    نسخه 3.5:
+    متن خبر و رسانه همیشه در همان یک پیام Telegram قرار می‌گیرند.
+    چون caption رسانه سقف 1024 کاراکتر دارد، فقط بخش بدنه خبر
+    در صورت نیاز کوتاه می‌شود؛ پیام متنی دومی ساخته نمی‌شود.
+    """
+    title = normalize_space(title)
+    body = (body or "").strip()
     footer = FOOTER
-    # Budget using escaped lengths, then escape only after cutting raw text so we
-    # never cut an HTML entity in half.
-    title_room = max(80, max_chars - len(footer) - 24)
-    if len(html.escape(raw_title)) > title_room:
-        raw_title = truncate_text(raw_title, max(40, title_room - 10))
-    escaped_title = html.escape(raw_title)
-    escaped_footer = html.escape(footer)
-    body_room = max(0, max_chars - len("<b></b>\n\n\n\n") - len(escaped_title) - len(escaped_footer))
-    body_part = raw_body
-    while len(html.escape(body_part)) > body_room and body_part:
-        body_part = truncate_text(body_part, max(1, int(len(body_part) * 0.85)))
-    caption = f"<b>{escaped_title}</b>\n\n{html.escape(body_part)}\n\n{escaped_footer}"
+
+    # ابتدا برای تیتر فضای کافی نگه می‌داریم.
+    title_room = max(100, max_chars - len(footer) - 20)
+    if len(title) > title_room:
+        title = truncate_text(title, title_room)
+
+    separators = 6  # فاصله‌های بین title/body/footer
+    body_room = max_chars - len(title) - len(footer) - separators
+
+    if body_room <= 0:
+        return f"{title}\n\n{footer}"[:max_chars]
+
+    body_part = truncate_text(body, body_room)
+    caption = f"{title}\n\n{body_part}\n\n{footer}"
+
+    # اگر به دلیل نحوه برش چند کاراکتر اضافه شد، فقط body را کوتاه‌تر می‌کنیم.
     if len(caption) > max_chars:
-        # Conservative final fallback that remains valid HTML.
-        raw_title = truncate_text(raw_title, 180)
-        escaped_title = html.escape(raw_title)
-        body_room = max(0, max_chars - len(f"<b>{escaped_title}</b>\n\n\n\n{escaped_footer}"))
-        caption = f"<b>{escaped_title}</b>\n\n{html.escape(raw_body[:body_room])}\n\n{escaped_footer}"
-    return caption
+        extra = len(caption) - max_chars
+        body_room = max(1, body_room - extra)
+        body_part = truncate_text(body, body_room)
+        caption = f"{title}\n\n{body_part}\n\n{footer}"
+
+    return caption[:max_chars]
+
+
+def caption_bold_entities(caption):
+    first_line = str(caption or "").split("\n", 1)[0]
+    if not first_line:
+        return []
+    return [{"type": "bold", "offset": 0, "length": _utf16_len(first_line)}]
 
 
 def send_photo_to_telegram(title, body, photo_url):
@@ -2610,7 +2661,7 @@ def send_photo_to_telegram(title, body, photo_url):
                 data={
                     "chat_id": TARGET_CHAT_ID,
                     "caption": caption,
-                    "parse_mode": "HTML",
+                    "caption_entities": json.dumps(caption_bold_entities(caption)),
                 },
                 files={
                     "photo": (
@@ -2638,7 +2689,7 @@ def send_photo_file_id_to_telegram(title, body, photo_file_id):
             "chat_id": TARGET_CHAT_ID,
             "photo": photo_file_id,
             "caption": build_media_caption(title, body, 1024),
-            "parse_mode": "HTML",
+            "caption_entities": json.dumps(caption_bold_entities(build_media_caption(title, body, 1024))),
         },
         timeout=30,
     )
@@ -2661,7 +2712,7 @@ def send_video_to_telegram(title, body, video_url):
                 data={
                     "chat_id": TARGET_CHAT_ID,
                     "caption": caption,
-                    "parse_mode": "HTML",
+                    "caption_entities": json.dumps(caption_bold_entities(caption)),
                     "supports_streaming": "true",
                 },
                 files={
@@ -2742,10 +2793,10 @@ def build_text_only_message(item):
     body = format_public_body(item)
     parts = []
     if title:
-        parts.append("<b>" + html.escape(title) + "</b>")
+        parts.append(title)
     if body:
-        parts.append(html.escape(body))
-    parts.append(html.escape(FOOTER))
+        parts.append(body)
+    parts.append(FOOTER)
     return "\n\n".join(parts)
 
 
@@ -2788,13 +2839,15 @@ def dispatch_item(item, state=None):
             item["_sent_media_type"] = "video"
             return result
         except TelegramAPIError as exc:
-            if exc.status_code == 429:
+            if exc.status_code == 429 or getattr(exc, "delivery_uncertain", False):
                 raise
             if is_recoverable_media_error(exc):
                 log.warning("ویدیو توسط Telegram رد شد؛ به عکس/متن fallback می‌کنیم: %s", exc)
             else:
                 raise
         except Exception as exc:
+            if isinstance(exc, TelegramTransportError):
+                raise
             log.warning("دریافت/ارسال ویدیو شکست خورد؛ به عکس/متن fallback می‌کنیم: %s", exc)
 
     if item.get("photo_file_id"):
@@ -2803,10 +2856,12 @@ def dispatch_item(item, state=None):
             item["_sent_media_type"] = "photo"
             return result
         except TelegramAPIError as exc:
-            if exc.status_code == 429:
+            if exc.status_code == 429 or getattr(exc, "delivery_uncertain", False):
                 raise
             log.warning("ارسال عکس file_id شکست خورد؛ fallback فعال می‌شود: %s", sanitize_error_text(exc))
         except Exception as exc:
+            if isinstance(exc, TelegramTransportError):
+                raise
             log.warning("ارسال عکس file_id شکست خورد؛ fallback فعال می‌شود: %s", sanitize_error_text(exc))
 
     if photo:
@@ -2815,18 +2870,21 @@ def dispatch_item(item, state=None):
             item["_sent_media_type"] = "photo"
             return result
         except TelegramAPIError as exc:
-            if exc.status_code == 429:
+            if exc.status_code == 429 or getattr(exc, "delivery_uncertain", False):
                 raise
             if is_recoverable_media_error(exc):
                 log.warning("عکس توسط Telegram رد شد؛ به متن fallback می‌کنیم: %s", exc)
             else:
                 raise
         except Exception as exc:
+            if isinstance(exc, TelegramTransportError):
+                raise
             log.warning("دریافت/ارسال عکس شکست خورد؛ به متن fallback می‌کنیم: %s", exc)
 
     # در صورت شکست رسانه، متن کامل خبر منتشر می‌شود؛ ادامه‌ی جداگانه‌ای برای رسانه نداریم.
     item["_sent_media_type"] = "text"
-    return send_text_to_telegram(build_text_only_message(item))
+    public_title = format_public_title(item)
+    return send_text_to_telegram(build_text_only_message(item), bold_prefix_len=len(public_title))
 
 
 # ============================================================
@@ -2863,7 +2921,7 @@ def purge_recent_inputs(state):
     ][-800:]
 
 
-def is_input_duplicate(state, post):
+def _is_input_duplicate_unlocked(state, post):
     """فقط near-exact raw duplicates را قبل از AI حذف می‌کند؛ updateهای واقعی رد نمی‌شوند."""
     purge_recent_inputs(state)
     text = normalize_space(post.get("text", ""))
@@ -2887,6 +2945,12 @@ def is_input_duplicate(state, post):
             if overlap >= 0.75 and min(len(current_tokens), len(old_tokens)) >= 6:
                 return True
     return False
+
+
+def is_input_duplicate(state, post):
+    """Serialize duplicate-memory reads and cleanup with other state mutations."""
+    with STATE_LOCK:
+        return _is_input_duplicate_unlocked(state, post)
 
 
 def remember_input_posts(state, posts):
@@ -3149,7 +3213,7 @@ def mark_retry_uids(state, posts, minutes=None):
         }
 
 
-def is_retry_blocked(state, uid):
+def _is_retry_blocked_unlocked(state, uid):
     if not uid:
         return False
     retry = state.get("_retry_uids", {})
@@ -3175,6 +3239,11 @@ def is_retry_blocked(state, uid):
         retry.pop(uid, None)
         return False
     return True
+
+
+def is_retry_blocked(state, uid):
+    with STATE_LOCK:
+        return _is_retry_blocked_unlocked(state, uid)
 
 
 # ============================================================
@@ -3220,8 +3289,11 @@ def enqueue_item(state, item):
         item.get("title", ""), item.get("body", "")
     )
     item.setdefault("queued_at", now_ts())
+    item.setdefault("admin_id", sha1_text(f"{item.get('queued_at')}|{item.get('title','')}|{item.get('event_key','')}")[:12])
     item.setdefault("important", False)
     item.setdefault("urgent", False)
+    item.setdefault("delivery_status", "queued")
+    item.setdefault("manual_priority", 0)
     item.setdefault("region", "world")
     item.setdefault("entities", [])
     item["fingerprint"] = item_fingerprint(item)
@@ -3259,8 +3331,6 @@ def enqueue_item(state, item):
 
 def compute_publish_spacing_minutes(now_dt, state=None):
     settings = admin_settings(state) if state is not None else {}
-    if state is not None and state.get("_profile") == "war":
-        return 10
     start_hour = safe_int(settings.get("active_start_hour", 8), 8)
     afternoon_hour = safe_int(settings.get("afternoon_start_hour", 14), 14)
     end_hour = safe_int(settings.get("active_end_hour", 24), 24)
@@ -3273,24 +3343,33 @@ def compute_publish_spacing_minutes(now_dt, state=None):
 
 def choose_next_queue_item(state):
     queue = state.get("_pending_queue", [])
-    if safe_float(state.get("_paused_until"), 0) > now_ts():
-        return None, None
-    pause_for_important = bool(state.get("_pause_until_important"))
     if not queue:
         return None, None
+
+    # پست Pinشده در نوبت بعدی انتخاب می‌شود؛ زمان‌بندی آن عمداً به اکنون برمی‌گردد.
+    pinned_id = str(state.get("_priority_pin_id", "") or "")
+    if pinned_id:
+        for pin_index, pin_item in enumerate(queue):
+            eligible_status = pin_item.get("delivery_status", "queued") not in {"sending", "uncertain", "partial", "sent"}
+            eligible_time = not safe_float(pin_item.get("scheduled_at", 0), 0) or safe_float(pin_item.get("scheduled_at", 0), 0) <= now_ts()
+            if (str(pin_item.get("admin_id", "")) == pinned_id and eligible_status and eligible_time
+                    and not safe_bool(pin_item.get("manual_approval_required"))
+                    and safe_int(pin_item.get("news_score"), 0) >= MIN_NEWS_SCORE):
+                return pin_index, dict(pin_item)
 
     # امتیاز هر بار بر اساس وضعیت تنوع دوباره محاسبه می‌شود.
     candidates = []
     for index, item in enumerate(queue):
-        if item.get("delivery_status") in {"sending", "needs_review"}:
-            continue
-        if pause_for_important and not (safe_bool(item.get("urgent")) or safe_int(item.get("news_score"), 0) >= 85):
-            continue
         scheduled_at = safe_float(item.get("scheduled_at", 0), 0)
         if scheduled_at and scheduled_at > now_ts():
             continue
+        if item.get("delivery_status") in {"sending", "uncertain", "partial", "sent"}:
+            continue
+        if safe_bool(item.get("manual_approval_required")):
+            continue
         item = dict(item)
         score = apply_queue_diversity_score(state, item)
+        score += safe_int(item.get("manual_priority", 0), 0)
 
         news_score = safe_int(item.get("news_score"), 0)
         if news_score < MIN_NEWS_SCORE:
@@ -3323,9 +3402,7 @@ def choose_next_queue_item(state):
         ),
         reverse=True,
     )
-    pinned_id = str(state.get("_pinned_queue_id", ""))
-    pinned = next((row for row in pool if str(row[2].get("admin_id", "")) == pinned_id), None)
-    _, index, chosen = pinned or pool[0]
+    _, index, chosen = pool[0]
     return index, chosen
 
 
@@ -3343,12 +3420,33 @@ def mark_posted_region(state, item):
         state["_last_posted_buckets"] = bucket_recent[-CONTENT_BUCKET_WINDOW:]
 
 
-def process_queue(state):
+def _process_queue_unlocked(state):
     settings = admin_settings(state)
+    pause_until = safe_float(state.get("_paused_until", 0), 0)
+    if pause_until and now_ts() >= pause_until:
+        state["_paused_until"] = 0
+        save_state(state)
+    if state.get("_pause_until_important"):
+        has_important = any(
+            (safe_bool(x.get("urgent")) or safe_bool(x.get("important")))
+            and x.get("delivery_status", "queued") not in {"sending", "uncertain", "partial", "sent"}
+            and not safe_bool(x.get("manual_approval_required"))
+            and (not safe_float(x.get("scheduled_at", 0), 0) or safe_float(x.get("scheduled_at", 0), 0) <= now_ts())
+            and safe_int(x.get("news_score"), 0) >= MIN_NEWS_SCORE
+            for x in state.get("_pending_queue", [])
+        )
+        if has_important:
+            state["_pause_until_important"] = False
+            save_state(state)
+        else:
+            return
+    elif safe_float(state.get("_paused_until", 0), 0) > now_ts():
+        return
     if not settings.get("auto_publish_enabled", True) or settings.get("emergency_stop", False):
         return
     if is_test_mode(state):
         return
+    ensure_queue_ids(state)
     queue = state.get("_pending_queue", [])
     if not queue:
         return
@@ -3374,8 +3472,6 @@ def process_queue(state):
     index, item = choose_next_queue_item(state)
     if item is None:
         return
-    # choose_next_queue_item calculates a scoring copy; journal the actual queued object.
-    item = queue[index]
 
     # آخرین سد تکراری: هم حافظه منتشرشده و هم update logic بررسی می‌شود.
     relation = compare_event_relation(state, item, recent_memory_items(state))
@@ -3387,62 +3483,82 @@ def process_queue(state):
         save_state(state)
         return
 
-    # Persist a send journal before the external side effect. Telegram Bot API has no
-    # idempotency key, so ambiguous failures are quarantined for manual reconciliation.
-    item["delivery_status"] = "sending"
-    item["delivery_started_ts"] = now_ts()
-    item["delivery_attempts"] = safe_int(item.get("delivery_attempts"), 0) + 1
-    save_state(state)
+    # Write-ahead intent: after a restart an uncertain send will not be auto-sent twice.
+    queue_item = next((x for x in queue if str(x.get("admin_id", "")) == str(item.get("admin_id", ""))), None)
+    if queue_item is not None:
+        queue_item["delivery_status"] = "sending"
+        queue_item["delivery_started_ts"] = now_ts()
+        queue_item["delivery_attempts"] = safe_int(queue_item.get("delivery_attempts", 0), 0) + 1
+        queue_item["_delivery_message_ids"] = []
+        save_state(state)
     try:
-        dispatch_result = dispatch_item(item, state=state)
+        with STATE_LOCK:
+            dispatch_result = dispatch_item(item, state=state)
         if isinstance(dispatch_result, dict) and dispatch_result.get("test_mode"):
-            item["delivery_status"] = "queued"
-            save_state(state)
+            if queue_item is not None:
+                queue_item["delivery_status"] = "queued"
+                save_state(state)
             return
     except TelegramAPIError as exc:
+        if queue_item is not None:
+            partial_ids = getattr(exc, "partial_message_ids", [])
+            queue_item["_delivery_message_ids"] = partial_ids
+            if partial_ids:
+                queue_item["delivery_status"] = "partial"
+                queue_item["delivery_error"] = "ارسال چندبخشی ناقص؛ از انتشار خودکار مجدد جلوگیری شد"
+            elif getattr(exc, "delivery_uncertain", False):
+                queue_item["delivery_status"] = "uncertain"
+                queue_item["delivery_uncertain_ts"] = now_ts()
+                queue_item["delivery_error"] = sanitize_error_text(exc)[:240]
+            else:
+                # 4xx/429 normally means the send was rejected, so retry is not ambiguous.
+                queue_item["delivery_status"] = "queued"
         record_system_error(state, "Telegram", "انتشار خودکار صف", exc, status_code=exc.status_code)
         if exc.status_code == 429:
-            item["delivery_status"] = "queued"
             save_state(state)
             log.warning(
                 "Telegram rate limit در صف؛ %s ثانیه بعد دوباره تلاش می‌شود.",
                 exc.retry_after,
             )
             return
-        log.error("نتیجه انتشار Telegram قطعی نیست؛ خبر برای بررسی دستی قرنطینه شد: %s", sanitize_error_text(exc))
-        item["delivery_status"] = "needs_review"
-        item["delivery_error"] = sanitize_error_text(exc)[:400]
+        log.error("خطای Telegram در انتشار صف: %s", sanitize_error_text(exc))
         save_state(state)
         return
     except Exception as exc:
+        if queue_item is not None:
+            partial_ids = getattr(exc, "partial_message_ids", [])
+            queue_item["_delivery_message_ids"] = partial_ids
+            queue_item["delivery_status"] = "uncertain" if not partial_ids else "partial"
+            queue_item["delivery_uncertain_ts"] = now_ts()
+            queue_item["delivery_error"] = sanitize_error_text(exc)[:240]
         record_system_error(state, "Telegram", "انتشار خودکار صف", exc)
-        item["delivery_status"] = "needs_review"
-        item["delivery_error"] = sanitize_error_text(exc)[:400]
-        log.error("نتیجه ارسال مبهم است؛ خبر برای بررسی دستی قرنطینه شد: %s", sanitize_error_text(exc))
+        log.error("خطا در انتشار آیتم صف؛ برای جلوگیری از انتشار تکراری وضعیت بررسی دستی ثبت شد: %s", sanitize_error_text(exc))
         save_state(state)
         return
 
     queue.pop(index)
     state["_pending_queue"] = queue
+    if str(state.get("_priority_pin_id", "")) == str(item.get("admin_id", "")):
+        state["_priority_pin_id"] = ""
     state["_last_queue_release_ts"] = now_ts()
     mark_posted_region(state, item)
     remember_item(state, item)  # فقط پس از انتشار موفق، نه صرفاً enqueue.
     record_published_item(state, item, dispatch_result, manual=False)
-    for source_name in item.get("source_channels", []):
-        metric = state.setdefault("_source_metrics", {}).setdefault(source_name, {"fetched": 0, "published": 0, "rejected": 0, "errors": 0, "last_fetch_ts": 0})
-        metric["published"] = safe_int(metric.get("published"), 0) + 1
-    if state.get("_pause_until_important") and (item.get("urgent") or safe_int(item.get("news_score"), 0) >= 85):
-        state["_pause_until_important"] = False
     save_state(state)
 
     log.info(
-        "پست منتشر شد | ai_provider=%s | region=%s | score=%s | queue=%s | spacing=%s دقیقه",
-        item.get("ai_provider", "unknown"),
+        "پست منتشر شد | provider_pipeline=%s | region=%s | score=%s | queue=%s | spacing=%s دقیقه",
+        ">".join(AI_PROVIDER_LABELS[x] for x in runtime_provider_order(state)),
         item.get("region"),
         item.get("priority_score"),
         len(queue),
         spacing,
     )
+
+
+def process_queue(state):
+    with STATE_LOCK:
+        return _process_queue_unlocked(state)
 
 
 # ============================================================
@@ -3457,7 +3573,7 @@ def combine_original_media(cluster):
     return photo, video, source_url, source_urls
 
 
-def process_cluster(state, source_key, cluster):
+def _process_cluster_unlocked(state, source_key, cluster):
     if not cluster:
         return
 
@@ -3469,13 +3585,7 @@ def process_cluster(state, source_key, cluster):
     source_name = "، ".join(source_names) if source_names else source_key
 
     # Stage 1: استخراج رویداد/خبر و نگارش اولیه با زنجیره سه‌موتوره.
-    rejection_count_before = safe_int(state.get("_editorial_reject_count"), 0)
     drafts, first_provider = analyze_and_rewrite_safe(state, cluster, source_name)
-    if not drafts and safe_int(state.get("_editorial_reject_count"), 0) > rejection_count_before:
-        # A low-score editorial rejection is a valid final decision, not an API failure.
-        for post in cluster:
-            record_decision(state, post.get("title") or post.get("text", "")[:140], "رد تحریریه‌ای", "امتیاز ارزش خبری پایین‌تر از حداقل؛ تلاش مجدد خودکار انجام نمی‌شود")
-        return
     if not drafts:
         for post in cluster:
             record_decision(state, post.get("title") or post.get("text", "")[:140], "رد‌شده", "خروجی قابل استفاده از AI دریافت نشد")
@@ -3574,8 +3684,11 @@ def process_cluster(state, source_key, cluster):
             "is_update": safe_bool(result.get("is_update")),
             "needs_editor": safe_bool(result.get("needs_editor")),
             "source_uids": [p.get("uid") for p in linked_posts if p.get("uid")],
-            "source_channels": sorted({str(p.get("source_name", "")) for p in linked_posts if p.get("source_name")}),
-            "ai_provider": str(editor_provider or first_provider or "unknown"),
+            "source_channels": sorted({str(p.get("_source_key", "")).replace("tg:", "") for p in linked_posts if p.get("_source_key")}),
+            "classification_model": next((p.get("classification_model") for p in linked_posts if p.get("classification_model")), "disabled"),
+            "ai_provider_stage1": first_provider or "unknown",
+            "ai_provider_editor": (editor_provider or "not_used") if needs_editor and EDITOR_ENABLED else "not_used",
+            "ai_provider": (f"{first_provider or 'unknown'} + editor:{editor_provider}" if needs_editor and EDITOR_ENABLED else (first_provider or "unknown")),
             "novelty_score": safe_int(result.get("novelty_score"), 0),
             "entities": result.get("entities", [])[:10],
             "source_url": result_source_url or first_source_url,
@@ -3584,6 +3697,14 @@ def process_cluster(state, source_key, cluster):
             "video": result_video or shared_video,
             "queued_at": now_ts(),
         }
+
+        priority_terms = [str(x).lower() for x in state.get("_priority_keywords", []) if str(x).strip()]
+        matched_priority_terms = [term for term in priority_terms if term in (title + "\n" + body).lower()]
+        if matched_priority_terms:
+            item["manual_priority"] = min(5000, 100 * len(matched_priority_terms))
+            item["matched_priority_keywords"] = matched_priority_terms[:10]
+        item["delivery_status"] = "queued"
+        apply_auto_approve_rules(state, item)
 
         if not is_allowed_content_bucket(item["content_bucket"]):
             log.info("خبر خارج از سبد محتوایی حذف شد: %s", title)
@@ -3614,12 +3735,6 @@ def process_cluster(state, source_key, cluster):
         if not item["photo"] and not item["video"]:
             item["photo"] = choose_image_url(item, linked_posts)
 
-        # Rules configured by admin are applied before enqueue.
-        blocked_reason = keyword_block_reason(item, state)
-        if blocked_reason:
-            record_decision(state, title, "رد‌شده", blocked_reason, item["news_score"])
-            successful_interpretation = True
-            continue
         # قبل از enqueue یک بار صف را بررسی می‌کنیم؛ remember_item دیگر اینجا اجرا نمی‌شود.
         if enqueue_item(state, item):
             record_decision(state, title, "وارد صف", "از فیلترهای ارزش خبری، سبد محتوایی و تکراری عبور کرد", item["news_score"])
@@ -3631,6 +3746,12 @@ def process_cluster(state, source_key, cluster):
 
     if not successful_interpretation:
         raise ValueError("هیچ خروجی معتبر از cluster تولید نشد.")
+
+
+
+def process_cluster(state, source_key, cluster):
+    with STATE_LOCK:
+        return _process_cluster_unlocked(state, source_key, cluster)
 
 
 def process_source(state, source_key, posts):
@@ -3687,7 +3808,7 @@ def purge_unimportant_queue(state, today_str):
     save_state(state)
 
 
-def check_scheduled_messages(state):
+def _check_scheduled_messages_unlocked(state):
     now = now_tehran()
     today_str = now.strftime("%Y-%m-%d")
     settings = admin_settings(state)
@@ -3723,97 +3844,9 @@ def check_scheduled_messages(state):
         purge_unimportant_queue(state, today_str)
 
 
-# ============================================================
-# v5.3 alerts, weekly digest, source metrics and rule helpers
-# ============================================================
-
-def notify_owner(state, text, key, cooldown_seconds=3600):
-    if not OWNER_TELEGRAM_ID:
-        return
-    alerts = state.setdefault("_alert_state", {})
-    now = now_ts()
-    if now - safe_float(alerts.get(key, 0), 0) < cooldown_seconds:
-        return
-    try:
-        telegram_request("sendMessage", data={"chat_id": OWNER_TELEGRAM_ID, "text": text}, timeout=20)
-        alerts[key] = now
-    except Exception as exc:
-        log.warning("ارسال هشدار مالک ناموفق بود: %s", sanitize_error_text(exc))
-
-
-def check_v53_alerts(state):
-    settings = admin_settings(state)
-    enabled = [p for p in runtime_provider_order(state) if AI_PROVIDER_KEYS.get(p)]
-    unavailable = [p for p in enabled if safe_float(provider_state(state, p).get("cooldown_until"), 0) > now_ts()]
-    if enabled and len(unavailable) == len(enabled):
-        notify_owner(state, "🚨 هشدار رپتور: همه ارائه‌دهنده‌های AI در cooldown هستند. پنل AI و آخرین خطاها را بررسی کن.", "all_ai_down", 1800)
-    last_post = safe_float(state.get("_runtime", {}).get("last_posted_ts"), 0)
-    reference_post = last_post or safe_float(state.get("_runtime", {}).get("started_ts"), now_ts())
-    if now_ts() - reference_post > 4 * 3600:
-        notify_owner(state, "⚠️ رپتور بیش از ۴ ساعت است پستی منتشر نکرده. صف، ساعات سکوت، توقف و سقف روزانه را بررسی کن.", "no_posts_4h", 7200)
-    queue_len = len(state.get("_pending_queue", []))
-    if queue_len >= 80:
-        notify_owner(state, f"📥 هشدار رپتور: صف انتشار به {queue_len} خبر رسیده است.", "queue_high", 3600)
-    daily_limit = safe_int(settings.get("daily_post_limit"), 0)
-    today_count = published_count_today(state)
-    if daily_limit and today_count >= max(1, int(daily_limit * 0.9)):
-        notify_owner(state, f"📊 رپتور به {today_count}/{daily_limit} پست روزانه رسیده است.", "daily_limit_near", 3600)
-
-
-def maybe_send_weekly_summary(state):
-    now = now_tehran()
-    # Sunday evening Tehran time; send at most once per ISO week.
-    if now.weekday() != 6 or now.hour < 20:
-        return
-    key = now.strftime("%G-W%V")
-    if state.get("_last_weekly_summary_key") == key:
-        return
-    history = [x for x in state.get("_published_history", []) if safe_float(x.get("ts"), 0) >= now_ts() - 7 * 86400]
-    by_provider, by_source, by_bucket = {}, {}, {}
-    for item in history:
-        provider = item.get("ai_provider", "unknown")
-        by_provider[provider] = by_provider.get(provider, 0) + 1
-        for src in item.get("source_channels", []) or []:
-            by_source[src] = by_source.get(src, 0) + 1
-        bucket = item.get("content_bucket", "unknown")
-        by_bucket[bucket] = by_bucket.get(bucket, 0) + 1
-    lines = ["📅 جمع‌بندی هفتگی رپتور", f"پست‌های ثبت‌شده در ۷ روز اخیر: {len(history)}", "", "🤖 ارائه‌دهنده AI ثبت‌شده:"]
-    lines += [f"• {k}: {v}" for k, v in sorted(by_provider.items(), key=lambda x: -x[1])] or ["• داده‌ای موجود نیست"]
-    lines += ["", "📡 منابع پست‌های منتشرشده:"]
-    lines += [f"• {k}: {v}" for k, v in sorted(by_source.items(), key=lambda x: -x[1])[:12]] or ["• داده‌ای موجود نیست"]
-    lines += ["", "🗂 موضوع‌ها:"]
-    lines += [f"• {k}: {v}" for k, v in sorted(by_bucket.items(), key=lambda x: -x[1])] or ["• داده‌ای موجود نیست"]
-    if OWNER_TELEGRAM_ID:
-        try:
-            telegram_request("sendMessage", data={"chat_id": OWNER_TELEGRAM_ID, "text": "\n".join(lines)}, timeout=25)
-            state["_last_weekly_summary_key"] = key
-        except Exception as exc:
-            log.warning("ارسال جمع‌بندی هفتگی ناموفق بود: %s", sanitize_error_text(exc))
-
-
-def keyword_block_reason(item, state):
-    text = normalize_for_match(f"{item.get('title','')} {item.get('body','')}")
-    for word in state.get("_blocked_keywords", []):
-        if normalize_for_match(word) and normalize_for_match(word) in text:
-            return f"واژه مسدودشده: {word}"
-    for topic, until in state.get("_topic_silences", {}).items():
-        if safe_float(until, 0) > now_ts() and normalize_for_match(topic) in text:
-            return f"سکوت موضوعی فعال: {topic}"
-    allowed_topics = state.get("_only_region", "")
-    if allowed_topics == "iran" and item.get("region") != "iran":
-        return "حالت فقط خبرهای ایران فعال است"
-    return ""
-
-
-def write_history_csv(state, path):
-    import csv
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=["ts", "message_id", "title", "news_score", "ai_provider", "source_channels", "content_bucket", "verification"], extrasaction="ignore")
-        writer.writeheader()
-        for item in state.get("_published_history", []):
-            row = dict(item)
-            row["source_channels"] = ",".join(row.get("source_channels", []) or [])
-            writer.writerow(row)
+def check_scheduled_messages(state):
+    with STATE_LOCK:
+        return _check_scheduled_messages_unlocked(state)
 
 
 # ============================================================
@@ -3879,49 +3912,7 @@ def log_runtime_health(state):
     )
 
 
-def classify_posts_cheap(state, posts):
-    """Optional first-pass classifier. Fails open if Groq/model/JSON is unavailable."""
-    enabled = os.environ.get("AI_CLASSIFIER_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
-    model = os.environ.get("AI_CLASSIFIER_MODEL", "llama-3.1-8b-instant").strip()
-    if not enabled or not GROQ_API_KEYS or len(posts) < 2:
-        return posts
-    payload = [{"id": i + 1, "text": truncate_text(p.get("text", ""), 900)} for i, p in enumerate(posts)]
-    prompt = ("You are a conservative news relevance filter for a Persian defense/security/geopolitics news channel. "
-              "Return JSON only: {\"items\":[{\"id\":1,\"relevant\":true}]}. "
-              "Keep a post if it contains a potentially meaningful factual development, official statement, defense technology, "
-              "military/security event, geopolitics, or credible analysis. Reject only obvious ads, greetings, spam, memes, "
-              "empty posts, or clearly unrelated lifestyle content. When uncertain, relevant=true. Items: "
-              + json.dumps(payload, ensure_ascii=False))
-    try:
-        response = requests.post(GROQ_API_URL, headers={"Authorization": f"Bearer {GROQ_API_KEYS[0]}", "Content-Type": "application/json"},
-            json={"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0, "max_tokens": 900, "response_format": {"type": "json_object"}}, timeout=25)
-        if not response.ok:
-            return posts
-        raw = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-        parsed = json.loads(raw)
-        decisions = {safe_int(x.get("id"), 0): safe_bool(x.get("relevant", True)) for x in parsed.get("items", []) if isinstance(x, dict)}
-        if not decisions:
-            return posts
-        kept, dropped = [], 0
-        for i, post in enumerate(posts, start=1):
-            if decisions.get(i, True):
-                kept.append(post)
-            else:
-                dropped += 1
-                record_decision(state, post.get("title") or post.get("text", "")[:120], "رد فیلتر اولیه", f"طبقه‌بند سبک {model} آن را کم‌ارتباط تشخیص داد")
-                source_key, uid = post.get("_source_key"), post.get("uid")
-                if source_key and uid:
-                    current = state.setdefault(source_key, [])
-                    if uid not in current: current.append(uid)
-                    state[source_key] = current[-500:]
-        state.setdefault("_runtime", {})["last_classifier"] = {"model": model, "input": len(posts), "kept": len(kept), "dropped": dropped, "ts": now_ts()}
-        return kept
-    except Exception as exc:
-        log.warning("فیلتر اولیه سبک fail-open شد؛ همه ورودی‌ها به مسیر اصلی می‌روند: %s", sanitize_error_text(exc))
-        return posts
-
-
-def _process_once_unlocked(state):
+def process_once(state):
     """
     چرخه v5: گردآوری چندمنبعی، پردازش محدودشده AI و انتشار قابل‌کنترل.
     1) جمع‌آوری از همه منابع
@@ -3933,35 +3924,28 @@ def _process_once_unlocked(state):
     7) صف و زمان‌بندی ثابت
     """
     all_new_posts = []
-    runtime = state.setdefault("_runtime", {})
-    runtime["last_source_check_ts"] = now_ts()
-    runtime["last_cycle_error"] = ""
-    save_state(state)
+    with STATE_LOCK:
+        runtime = state.setdefault("_runtime", {})
+        runtime["last_source_check_ts"] = now_ts()
+        runtime["last_cycle_error"] = ""
+        save_state(state)
 
     for channel in runtime_source_channels(state):
         source_key = f"tg:{channel}"
-        metric = state.setdefault("_source_metrics", {}).setdefault(channel, {"fetched": 0, "published": 0, "rejected": 0, "errors": 0, "fail_streak": 0, "last_fetch_ts": 0})
-        metric["last_fetch_ts"] = now_ts()
-        try:
-            posts = fetch_channel_posts(channel, state=state)
-            metric["fetched"] = safe_int(metric.get("fetched"), 0) + len(posts or [])
-            metric["fail_streak"] = 0
-        except Exception as source_exc:
-            metric["errors"] = safe_int(metric.get("errors"), 0) + 1
-            metric["fail_streak"] = safe_int(metric.get("fail_streak"), 0) + 1
-            state.setdefault("_runtime", {})["last_source_error"] = sanitize_error_text(source_exc)
-            if metric["fail_streak"] >= 3:
-                notify_owner(state, f"⚠️ منبع @{channel} سه بار پیاپی با خطا مواجه شده است: {sanitize_error_text(source_exc)[:250]}", "source_fail_" + channel, 3600)
-            log.warning("دریافت منبع %s ناموفق بود: %s", channel, sanitize_error_text(source_exc))
-            continue
+        posts = fetch_channel_posts(channel, state=state)
+        with STATE_LOCK:
+            source_stats = state.setdefault("_source_stats", {}).setdefault(channel, {"scanned": 0, "fetched": 0, "new": 0, "published": 0, "rejected": 0, "errors": 0})
+            source_stats["scanned"] = safe_int(source_stats.get("scanned"), 0) + len(posts)
+            save_state(state)
         if not posts:
             continue
 
         processed = set(state.get(source_key, []))
         if not state.get("_source_initialized", {}).get(source_key):
-            state.setdefault("_source_initialized", {})[source_key] = True
-            state[source_key] = [p["uid"] for p in posts[-500:]]
-            save_state(state)
+            with STATE_LOCK:
+                state.setdefault("_source_initialized", {})[source_key] = True
+                state[source_key] = [p["uid"] for p in posts[-500:]]
+                save_state(state)
             log.info(
                 "منبع %s برای اولین بار ثبت شد؛ پست‌های موجود قدیمی پردازش نشدند.",
                 source_key,
@@ -3975,30 +3959,47 @@ def _process_once_unlocked(state):
             if is_retry_blocked(state, uid):
                 continue
             post["_source_key"] = source_key
+            with STATE_LOCK:
+                source_stats = state.setdefault("_source_stats", {}).setdefault(channel, {"scanned": 0, "fetched": 0, "new": 0, "published": 0, "rejected": 0, "errors": 0})
+                source_stats["fetched"] = safe_int(source_stats.get("fetched"), 0) + 1
+            if is_blocked_or_silenced(state, post.get("text", "")):
+                reason = block_or_silence_reason(state, post.get("text", ""))
+                with STATE_LOCK:
+                    record_decision(state, post.get("title") or post.get("text", "")[:140], "رد‌شده", reason)
+                    current = state.setdefault(source_key, [])
+                    if uid not in current: current.append(uid)
+                    state[source_key] = current[-500:]
+                    source_stats["rejected"] = safe_int(source_stats.get("rejected"), 0) + 1
+                    save_state(state)
+                continue
             all_new_posts.append(post)
+            with STATE_LOCK:
+                source_stats["new"] = safe_int(source_stats.get("new"), 0) + 1
 
     if all_new_posts:
+        all_new_posts = cheap_classify_posts(state, all_new_posts)
         filtered_new_posts = []
         locally_skipped = 0
         for post in all_new_posts:
-            if is_input_duplicate(state, post):
-                locally_skipped += 1
-                source_key = post.get("_source_key")
-                uid = post.get("uid")
-                if source_key and uid:
-                    current = state.setdefault(source_key, [])
-                    if uid not in current:
-                        current.append(uid)
-                    state[source_key] = current[-500:]
+            with STATE_LOCK:
+                duplicate_input = is_input_duplicate(state, post)
+                if duplicate_input:
+                    locally_skipped += 1
+                    source_key = post.get("_source_key")
+                    uid = post.get("uid")
+                    if source_key and uid:
+                        current = state.setdefault(source_key, [])
+                        if uid not in current:
+                            current.append(uid)
+                        state[source_key] = current[-500:]
+                    save_state(state)
+            if duplicate_input:
                 continue
             filtered_new_posts.append(post)
 
         if locally_skipped:
             log.info("%s پست near-exact duplicate قبل از AI حذف شد.", locally_skipped)
 
-        filtered_new_posts = classify_posts_cheap(state, filtered_new_posts)
-        if not filtered_new_posts:
-            all_new_posts = []
         clusters = cluster_posts(filtered_new_posts)
         ai_batches = build_gemini_batches(clusters)
         log.info(
@@ -4010,20 +4011,19 @@ def _process_once_unlocked(state):
         for batch in ai_batches:
             try:
                 process_cluster(state, "multi-source", batch)
-                remember_input_posts(state, batch)
-
-                for post in batch:
-                    source_key = post.get("_source_key")
-                    uid = post.get("uid")
-                    if not source_key or not uid:
-                        continue
-                    current = state.setdefault(source_key, [])
-                    if uid not in current:
-                        current.append(uid)
-                    state[source_key] = current[-500:]
-
-                clear_retry_uids(state, batch)
-                save_state(state)
+                with STATE_LOCK:
+                    remember_input_posts(state, batch)
+                    for post in batch:
+                        source_key = post.get("_source_key")
+                        uid = post.get("uid")
+                        if not source_key or not uid:
+                            continue
+                        current = state.setdefault(source_key, [])
+                        if uid not in current:
+                            current.append(uid)
+                        state[source_key] = current[-500:]
+                    clear_retry_uids(state, batch)
+                    save_state(state)
                 log.info(
                     "batch با %s پست پردازش شد؛ sources=%s",
                     len(batch),
@@ -4031,36 +4031,35 @@ def _process_once_unlocked(state):
                 )
 
             except AIAllProvidersUnavailable as exc:
-                mark_retry_uids(state, batch, minutes=AI_FAILURE_RETRY_MINUTES)
-                save_state(state)
+                with STATE_LOCK:
+                    mark_retry_uids(state, batch, minutes=AI_FAILURE_RETRY_MINUTES)
+                    save_state(state)
                 log.warning(
                     "همه موتورهای AI موقتاً در دسترس نبودند؛ batch برای retry نگه داشته شد: %s",
                     exc,
                 )
             except Exception as exc:
-                mark_retry_uids(state, batch)
-                save_state(state)
+                with STATE_LOCK:
+                    mark_retry_uids(state, batch)
+                    save_state(state)
                 log.error(
                     "batch شکست خورد و UIDها تا retry بعدی مصرف‌شده تلقی نشدند: %s",
                     exc,
                 )
 
-    runtime["last_source_count"] = len(all_new_posts)
+    with STATE_LOCK:
+        state.setdefault("_runtime", {})["last_source_count"] = len(all_new_posts)
     check_scheduled_messages(state)
     process_queue(state)
-    purge_recent_memories(state)
-    purge_recent_inputs(state)
-    log_runtime_health(state)
+    with STATE_LOCK:
+        purge_recent_memories(state)
+        purge_recent_inputs(state)
+        log_runtime_health(state)
+        state.setdefault("_runtime", {})["last_cycle_ok_ts"] = now_ts()
+        save_state(state)
+    # تماس شبکه‌ای هشدارها بیرون از قفل state انجام می‌شود تا پنل بی‌جهت منتظر نماند.
     check_v53_alerts(state)
     maybe_send_weekly_summary(state)
-    runtime["last_cycle_ok_ts"] = now_ts()
-    save_state(state)
-
-
-def process_once(state):
-    """Run one cycle under the shared state lock."""
-    with STATE_LOCK:
-        return _process_once_unlocked(state)
 
 
 # ============================================================
@@ -4093,11 +4092,8 @@ def admin_settings(state):
 
 def runtime_source_channels(state):
     configured = admin_settings(state).get("source_channels", SOURCE_CHANNELS) if state is not None else SOURCE_CHANNELS
-    configured = [str(x).strip().lstrip("@") for x in configured if str(x).strip()]
-    if state is None:
-        return configured
-    enabled = state.setdefault("_source_enabled", {})
-    return [x for x in configured if enabled.get(x, True)]
+    disabled = set(state.get("_disabled_sources", [])) if state is not None else set()
+    return [str(x).strip().lstrip("@") for x in configured if str(x).strip() and str(x).strip().lstrip("@") not in disabled]
 
 
 def runtime_provider_order(state):
@@ -4138,8 +4134,6 @@ def hour_is_active(hour, start_hour, end_hour):
 
 
 def is_quiet_hour(now_dt, state=None):
-    if state is not None and state.get("_profile") == "war":
-        return False
     settings = admin_settings(state) if state is not None else {}
     return not hour_is_active(
         now_dt.hour,
@@ -4253,6 +4247,7 @@ def record_published_item(state, item, result, manual=False):
         "ts": now_ts(), "title": str(item.get("title", ""))[:240],
         "body": str(item.get("body", ""))[:6500],
         "message_id": telegram_result_message_id(result),
+        "message_ids": (result.get("_all_message_ids", []) if isinstance(result, dict) else []),
         "chat_id": TARGET_CHAT_ID,
         "media_type": item.get("_sent_media_type") or ("video" if item.get("video") else ("photo" if item.get("photo") or item.get("photo_file_id") else "text")),
         "photo": item.get("photo"), "photo_file_id": item.get("photo_file_id"),
@@ -4260,14 +4255,22 @@ def record_published_item(state, item, result, manual=False):
         "manual": bool(manual), "deleted": False,
         "news_score": safe_int(item.get("news_score"), 0),
         "event_key": str(item.get("event_key", ""))[:140],
-        "ai_provider": str(item.get("ai_provider", "unknown")),
-        "source_channels": item.get("source_channels", []),
-        "content_bucket": item.get("content_bucket", "unknown"),
-        "verification": item.get("verification", "reported"),
+        "ai_provider": str(item.get("ai_provider", item.get("_ai_provider", "unknown")))[:80],
+        "ai_provider_stage1": str(item.get("ai_provider_stage1", "unknown"))[:40],
+        "ai_provider_editor": str(item.get("ai_provider_editor", "not_used"))[:40],
+        "classification_model": str(item.get("classification_model", "disabled"))[:80],
+        "verification": str(item.get("verification", "reported"))[:40],
+        "source_channels": list(item.get("source_channels", []))[:20],
+        "source_urls": list(item.get("source_urls", []))[:20],
+        "content_bucket": str(item.get("content_bucket", "world"))[:60],
+        "region": str(item.get("region", "world"))[:40],
     }
     history = state.setdefault("_published_history", [])
     history.append(record)
     state["_published_history"] = history[-MAX_ADMIN_HISTORY:]
+    for source in record.get("source_channels", []):
+        stat = state.setdefault("_source_stats", {}).setdefault(source, {"fetched": 0, "new": 0, "published": 0, "rejected": 0, "errors": 0})
+        stat["published"] = safe_int(stat.get("published"), 0) + 1
     runtime = state.setdefault("_runtime", {})
     runtime["last_posted_ts"] = record["ts"]
     return record
@@ -4373,7 +4376,9 @@ def admin_show_menu(chat_id, message_id=None, role="observer"):
             [admin_button("📝 گزارش فعالیت‌ها", "logs")],
             [admin_button("🛠 ابزارهای پیشرفته", "tools")],
         ])
-    admin_render(chat_id, "🦅 پنل مدیریت رپتور — نسخه ۵.۳\nیک بخش را انتخاب کن:", rows, message_id)
+    if role != "observer":
+        rows.append([admin_button("🧰 قابلیت‌های V5.3", "v53")])
+    admin_render(chat_id, f"🦅 پنل مدیریت رپتور — نسخه {BOT_VERSION}\nیک بخش را انتخاب کن:", rows, message_id)
 
 
 def render_stats(state, chat_id, message_id=None):
@@ -4399,9 +4404,8 @@ def render_stats(state, chat_id, message_id=None):
         p_lines.append(f"• {AI_PROVIDER_LABELS[provider]}: {status} | کلیدهای تنظیم‌شده: {configured}")
     source_error_line = f"آخرین خطای دریافت: {sanitize_error_text(rt.get('last_source_error'))}\n" if rt.get("last_source_error") else ""
     text = (
-        "📊 وضعیت رپتور\n\n"
+        f"📊 وضعیت رپتور — آخرین به‌روزرسانی: {now_tehran().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         f"وضعیت چرخه: {'خطای اخیر دارد' if rt.get('last_cycle_error') else 'فعال'}\n"
-        f"آخرین به‌روزرسانی داشبورد: {now_tehran().strftime('%Y-%m-%d %H:%M:%S')} تهران\n"
         f"مدت از آخرین راه‌اندازی: {hours} ساعت و {minutes} دقیقه\n"
         f"آخرین بررسی منابع: {datetime.fromtimestamp(last_source, TEHRAN_TZ or timezone.utc).strftime('%Y-%m-%d %H:%M') if last_source else 'هنوز ثبت نشده'}\n"
         f"آخرین دریافت موفق: {datetime.fromtimestamp(safe_float(rt.get('last_source_success_ts'), 0), TEHRAN_TZ or timezone.utc).strftime('%Y-%m-%d %H:%M') if safe_float(rt.get('last_source_success_ts'), 0) else 'هنوز ثبت نشده'}\n"
@@ -4409,6 +4413,7 @@ def render_stats(state, chat_id, message_id=None):
         f"{source_error_line}"
         f"آخرین انتشار: {datetime.fromtimestamp(last_post, TEHRAN_TZ or timezone.utc).strftime('%Y-%m-%d %H:%M') if last_post else 'هنوز ثبت نشده'}\n"
         f"صف انتشار: {len(state.get('_pending_queue', []))} خبر\n"
+        f"توقف زمان‌دار: {('تا ' + datetime.fromtimestamp(safe_float(state.get('_paused_until'), 0), TEHRAN_TZ or timezone.utc).strftime('%m-%d %H:%M')) if safe_float(state.get('_paused_until'), 0) > now_ts() else ('تا خبر مهم' if state.get('_pause_until_important') else 'ندارد')}\n"
         f"انتشار خودکار: {'روشن' if settings.get('auto_publish_enabled', True) else 'خاموش'}\n"
         f"توقف اضطراری: {'فعال' if settings.get('emergency_stop') else 'غیرفعال'}\n"
         f"حالت آزمایشی: {'روشن' if is_test_mode(state) else 'خاموش'}\n"
@@ -4433,11 +4438,6 @@ def render_settings(state, chat_id, message_id=None):
         "برای فاصله زمانی عدد دقیقه، برای ساعت‌های فعالیت سه عدد با ویرگول وارد کن: شروع,شروع‌بازه‌دوم,پایان (مثال: 8,14,24). پایان می‌تواند 24 باشد."
     )
     rows = [
-        [admin_button("⏸ توقف زمان‌دار", "pause"), admin_button("▶️ ادامه", "resume")],
-        [admin_button("⚔️ حالت جنگ", "profile|war"), admin_button("🕊 حالت عادی", "profile|normal")],
-        [admin_button("🚫 واژه‌های مسدودشده", "blockwords"), admin_button("⭐ واژه‌های اولویت‌دار", "prioritywords")],
-        [admin_button("🔕 سکوت موضوعی", "topicsilence")],
-        [admin_button("🔎 جستجوی تاریخچه", "historysearch"), admin_button("🆔 پیدا کردن message_id", "findmsg")],
         [admin_button("🔁 تغییر انتشار خودکار", "setting|auto")],
         [admin_button("🚨 توقف اضطراری", "setting|emergency")],
         [admin_button("⏱ فاصله بازه اول", "setprompt|morning_spacing")],
@@ -4490,7 +4490,7 @@ def render_queue(state, chat_id, message_id=None, page=0):
         [admin_button("📰 تاریخچه منتشرشده", "history")],
         [admin_button("⬅️ منوی اصلی", "menu")],
     ])
-    text = f"📥 صف انتشار — {len(queue)} خبر\nصفحه {page+1}\nبرای پیش‌نمایش روی خبر بزن."
+    text = f"📥 صف انتشار — {len(queue)} خبر\nآخرین بررسی پنل: {now_tehran().strftime('%Y-%m-%d %H:%M:%S')}\nصفحه {page+1}\nبرای پیش‌نمایش روی خبر بزن."
     if not queue:
         text += "\n\nصف خالی است."
     admin_render(chat_id, text, rows, message_id)
@@ -4509,23 +4509,33 @@ def render_queue_item(state, chat_id, item_id, message_id=None):
         f"تیتر: {item.get('title', '')}\n\n"
         f"{body}\n\n"
         f"امتیاز: {safe_int(item.get('news_score'), 0)} | منطقه: {item.get('region', '—')}\n"
+        f"منبع: {', '.join(item.get('source_channels', [])) or item.get('source_name', 'ثبت نشده')}\n"
+        f"هوش مصنوعی: {item.get('ai_provider', item.get('ai_provider_stage1', 'نامشخص'))}\n"
+        f"فیلتر اولیه: {item.get('classification_model', 'غیرفعال')}\n"
+        f"اعتبار: {item.get('verification', 'reported')} | وضعیت تحویل: {item.get('delivery_status', 'queued')}\n"
+        f"تأیید: {'نیازمند تأیید دستی' if item.get('manual_approval_required') else ('تأیید خودکار' if item.get('auto_approved_by_rule') else 'طبق سیاست جاری')}\n"
         f"رسانه: {'ویدیو' if item.get('video') else ('عکس' if item.get('photo') or item.get('photo_file_id') else 'بدون رسانه')}\n"
-        f"منابع: {', '.join(item.get('source_channels', [])) or 'در رکورد موجود نیست'}\n"
-        f"AI سازنده: {item.get('ai_provider', 'نامشخص')}\n"
-        f"وضعیت ارسال: {item.get('delivery_status', 'queued')}\n"
         f"زمان برنامه‌ریزی‌شده: {scheduled_text}"
     )
+    if item.get("delivery_status") in {"uncertain", "partial"}:
+        ids = item.get("_delivery_message_ids", [])
+        text += ("\n\n⚠️ نتیجه انتشار نامشخص/ناقص است؛ ربات آن را خودکار دوباره نمی‌فرستد. "
+                 f"شناسه‌های دریافت‌شده: {', '.join(str(x) for x in ids) or 'ثبت نشده'}"
+                 f"\nآخرین خطا: {item.get('delivery_error', 'ثبت نشده')}")
     rows = [
         [admin_button("🚀 انتشار فوری", f"confirm|qpublish|{item_id}")],
-        [admin_button("⬆️ بالای صف", f"qbump|{item_id}"), admin_button("⬇️ ته صف", f"qbottom|{item_id}")],
-        [admin_button("📌 انتشار بعدی", f"qpin|{item_id}"), admin_button("🔄 بازنویسی", f"qrewrite|{item_id}")],
         [admin_button("✏️ ویرایش متن", f"qedit|{item_id}"), admin_button("🖼 تغییر عکس/رسانه", f"qimg|{item_id}")],
-        [admin_button("⏰ تأخیر دقیقه‌ای", f"qdelay|{item_id}"), admin_button("🕘 ساعت دقیق", f"qtime|{item_id}")],
-        [admin_button("📚 مشاهده منابع", f"qsrc|{item_id}"), admin_button("🧾 متن کامل", f"qfull|{item_id}")],
-        [admin_button("♻️ بازگردانی به صف", f"qretry|{item_id}")],
+        [admin_button("⏰ تأخیر دقیقه‌ای", f"qdelay|{item_id}"), admin_button("🗓 ساعت دقیق", f"qexact|{item_id}")],
+        [admin_button("⬆️ بالای صف", f"qbump|{item_id}|top"), admin_button("⬇️ ته صف", f"qbump|{item_id}|bottom")],
+        [admin_button("📌 انتشار بعدی", f"qpin|{item_id}"), admin_button("🔄 بازنویسی", f"qrewrite|{item_id}")],
+        [admin_button("🔗 مشاهده منابع", f"qsources|{item_id}")],
+        [admin_button("🔎 بازبینی ادعا با AI", f"qverify|{item_id}")],
+        ([admin_button("✅ این خبر منتشر شده", f"qresolve|{item_id}|sent"), admin_button("⚠️ اجازه تلاش مجدد", f"qresolve|{item_id}|retry")] if item.get("delivery_status") in {"uncertain", "partial"} else []),
+        ([admin_button("✅ تأیید برای انتشار", f"qapprove|{item_id}")] if item.get("manual_approval_required") else []),
         [admin_button("🗑 رد و حذف خبر", f"confirm|qdelete|{item_id}")],
         [admin_button("⬅️ بازگشت به صف", "queue")],
     ]
+    rows = [row for row in rows if row]
     admin_render(chat_id, text, rows, message_id)
 
 
@@ -4545,9 +4555,8 @@ def render_history(state, chat_id, message_id=None, page=0):
         nav.append(admin_button("بعدی ▶️", f"historypage|{page+1}"))
     if nav:
         rows.append(nav)
-    rows.append([admin_button("📤 خروجی CSV", "historycsv")])
     rows.append([admin_button("⬅️ بازگشت", "news")])
-    text = f"🗃 تاریخچه انتشار — {len(history)} پست ثبت‌شده\nصفحه {page+1}\nآخرین به‌روزرسانی: {now_tehran().strftime('%Y-%m-%d %H:%M:%S')} تهران"
+    text = f"🗃 تاریخچه انتشار — {len(history)} پست ثبت‌شده\nآخرین بررسی پنل: {now_tehran().strftime('%Y-%m-%d %H:%M:%S')}\nصفحه {page+1}"
     if not history:
         text += "\nهنوز تاریخچه‌ای ذخیره نشده است."
     admin_render(chat_id, text, rows, message_id)
@@ -4567,7 +4576,17 @@ def render_history_item(state, chat_id, history_id, message_id=None):
         return
     ts = safe_float(item.get("ts"), 0)
     stamp = datetime.fromtimestamp(ts, TEHRAN_TZ or timezone.utc).strftime('%Y-%m-%d %H:%M') if ts else "نامشخص"
-    text = f"🗃 پست منتشرشده\n{stamp}\n\n{item.get('title','')}\n\n{item.get('body','')}\n\nشناسه پیام تلگرام: {item.get('message_id') or 'ثبت نشده'}"
+    source_urls = item.get("source_urls", []) if isinstance(item.get("source_urls"), list) else []
+    source_text = "\n".join(source_urls[:8]) or "ثبت نشده"
+    text = (f"🗃 پست منتشرشده\n{stamp}\n\n{item.get('title','')}\n\n{item.get('body','')}"
+            f"\n\nشناسه پیام تلگرام: {item.get('message_id') or 'ثبت نشده'}"
+            f"\nشناسه‌های قطعه‌ای: {', '.join(str(x) for x in item.get('message_ids', []) if x) or '—'}"
+            f"\nهوش مصنوعی مرحله اصلی: {item.get('ai_provider_stage1','unknown')}"
+            f"\nویراستار AI: {item.get('ai_provider_editor','not_used')}"
+            f"\nفیلتر اولیه: {item.get('classification_model','disabled')}"
+            f"\nوضعیت اعتبار: {item.get('verification','reported')}"
+            f"\nمنابع: {', '.join(item.get('source_channels', [])) or 'نامشخص'}"
+            f"\nپیوندهای منبع:\n{source_text}")
     role = admin_role(state, chat_id)
     if role == "observer":
         rows = [[admin_button("⬅️ تاریخچه", "history")]]
@@ -4633,15 +4652,15 @@ def render_ai_provider(state, chat_id, provider, message_id=None):
 
 
 def render_sources(state, chat_id, message_id=None):
-    settings = admin_settings(state)
-    channels = settings.get("source_channels", SOURCE_CHANNELS)
-    enabled = state.setdefault("_source_enabled", {})
+    configured = [str(x).strip().lstrip("@") for x in admin_settings(state).get("source_channels", SOURCE_CHANNELS) if str(x).strip()]
+    disabled = set(state.get("_disabled_sources", []))
     rows = []
-    for channel in channels:
-        label = ("🟢 فعال: @" if enabled.get(channel, True) else "⚪ غیرفعال: @") + channel
-        rows.append([admin_button(label, f"source_toggle|{channel}"), admin_button("🗑 حذف", f"confirm|sourcedel|{channel}")])
-    rows.extend([[admin_button("➕ افزودن کانال تلگرام", "sourceadd")], [admin_button("📊 عملکرد منابع", "source_stats")], [admin_button("⬅️ منوی اصلی", "menu")]])
-    admin_render(chat_id, "📡 منابع تلگرام\nسبز = فعال، خاکستری = موقتاً غیرفعال. منبع غیرفعال در تاریخچه باقی می‌ماند.", rows, message_id)
+    for source in configured:
+        rows.append([admin_button(("⚪ فعال‌سازی " if source in disabled else "🟢 غیرفعال‌سازی ") + "@" + source[:32], f"sourcetoggle|{source}")])
+        rows.append([admin_button("➖ حذف @" + source[:36], f"confirm|sourcedel|{source}")])
+    rows.extend([[admin_button("➕ افزودن کانال تلگرام", "sourceadd")], [admin_button("📈 عملکرد منابع", "sourcestats")], [admin_button("⬅️ منوی اصلی", "menu")]])
+    text = "📡 منابع تلگرام\n\n" + ("\n".join(("⚪ " if x in disabled else "🟢 ") + "@" + x for x in configured) if configured else "هیچ منبعی تنظیم نشده است") + "\n\nغیرفعال‌سازی موقت، منبع و تاریخچه آن را حذف نمی‌کند."
+    admin_render(chat_id, text, rows, message_id)
 
 
 def render_admins(state, chat_id, message_id=None):
@@ -4784,10 +4803,15 @@ def edit_published_message(item):
     if item.get("media_type") in {"photo", "video"}:
         text = build_media_caption(item.get("title", ""), item.get("body", ""), 1024)
         method = "editMessageCaption"
-        data = {"chat_id": item.get("chat_id", TARGET_CHAT_ID), "message_id": message_id, "caption": text}
+        data = {"chat_id": item.get("chat_id", TARGET_CHAT_ID), "message_id": message_id, "caption": text,
+                "caption_entities": json.dumps(caption_bold_entities(text))}
     else:
+        message_text = build_text_only_message(item)
+        title_len = _utf16_len(format_public_title(item))
         data = {"chat_id": item.get("chat_id", TARGET_CHAT_ID), "message_id": message_id,
-                "text": build_text_only_message(item), "disable_web_page_preview": "false"}
+                "text": message_text,
+                "entities": json.dumps([{"type": "bold", "offset": 0, "length": title_len}]) if title_len else "[]",
+                "disable_web_page_preview": "false"}
         method = "editMessageText"
     return telegram_request(method, data=data, timeout=25)
 
@@ -4802,7 +4826,8 @@ def edit_published_media(item):
     if not media:
         raise RuntimeError("برای این رکورد URL یا file_id عکس ذخیره نشده است؛ می‌توانی پست را حذف کنی و خبر را دوباره منتشر کنی.")
     caption = build_media_caption(item.get("title", ""), item.get("body", ""), 1024)
-    input_media = {"type": media_type, "media": media, "caption": caption}
+    input_media = {"type": media_type, "media": media, "caption": caption,
+                   "caption_entities": caption_bold_entities(caption)}
     return telegram_request("editMessageMedia", data={
         "chat_id": item.get("chat_id", TARGET_CHAT_ID),
         "message_id": message_id,
@@ -4817,27 +4842,127 @@ def delete_published_message(item):
     return telegram_request("deleteMessage", data={"chat_id": item.get("chat_id", TARGET_CHAT_ID), "message_id": message_id}, timeout=20)
 
 
+def rewrite_queue_item_with_style(state, user_id, chat_id, item_id, style_code, message_id=None):
+    item = find_queue_item(state, item_id)
+    if not item:
+        admin_render(chat_id, "خبر در صف پیدا نشد.", [[admin_button("صف", "queue")]], message_id)
+        return
+    styles = {
+        "short": "خبر را کوتاه‌تر کن؛ نام‌ها، اعداد، تاریخ‌ها و ادعاهای اصلی حفظ شوند.",
+        "formal": "خبر را رسمی‌تر، روشن‌تر و دقیق‌تر بنویس؛ بدون افزودن واقعیت.",
+        "context": "فقط زمینه‌ای را روشن‌تر کن که از متن موجود پشتیبانی می‌شود؛ هیچ واقعیت جدیدی نساز.",
+        "headline": "فقط تیتر را بهتر، روشن‌تر و دقیق‌تر کن؛ بدنه باید بدون تغییر معنایی باقی بماند.",
+    }
+    style_prompt = styles.get(style_code)
+    if not style_prompt:
+        admin_render(chat_id, "سبک بازنویسی ناشناخته است.", [[admin_button("بازگشت به خبر", f"q|{item_id}")]], message_id)
+        return
+    try:
+        prompt = ("فقط JSON معتبر با title و body برگردان. خبر فارسی را دقیق و بدون جعل بازنویسی کن. "
+                  + style_prompt + "\nتیتر: " + item.get("title", "") + "\nمتن: " + item.get("body", ""))
+        parsed, provider = ai_call_json(state, prompt, "admin_rewrite")
+        title = normalize_persian_text(str(parsed.get("title", "") if isinstance(parsed, dict) else ""))
+        body = normalize_persian_text(str(parsed.get("body", "") if isinstance(parsed, dict) else ""))
+        if not title or not body:
+            raise ValueError("خروجی بازنویسی قابل استفاده نبود؛ متن تغییری نکرد.")
+        item.setdefault("versions", []).append({"ts": now_ts(), "title": item.get("title", ""), "body": item.get("body", ""), "provider": provider or "unknown"})
+        item["versions"] = item["versions"][-20:]
+        item["title"], item["body"] = title[:240], body[:6500]
+        item["ai_provider_editor"] = provider or "unknown"
+        item["ai_provider"] = f"{item.get('ai_provider_stage1', 'unknown')} + admin_rewrite:{provider or 'unknown'}"
+        item["fingerprint"] = item_fingerprint(item)
+        save_state(state)
+        record_admin_activity(state, user_id, "بازنویسی سبک AI خبر", f"{item.get('title','')} / {style_code} / {provider}")
+        render_queue_item(state, chat_id, item_id, message_id)
+    except Exception as exc:
+        admin_render(chat_id, "بازنویسی انجام نشد: " + sanitize_error_text(exc), [[admin_button("بازگشت به خبر", f"q|{item_id}")]], message_id)
+
+
+def review_queue_item_with_ai(state, user_id, chat_id, item_id, message_id=None):
+    """AI-only consistency review; never misrepresents URL strings as independently verified sources."""
+    item = find_queue_item(state, item_id)
+    if not item:
+        admin_render(chat_id, "خبر در صف پیدا نشد.", [[admin_button("صف انتشار", "queue")]], message_id)
+        return
+    source_urls = item.get("source_urls", []) if isinstance(item.get("source_urls"), list) else []
+    prompt = (
+        "نقش: ویراستار کنترل کیفیت خبر فارسی. فقط مواد داده‌شده را بررسی کن؛ جست‌وجوی وب در اختیار تو نیست "
+        "و صرف دیدن URL به معنی خواندن منبع نیست. هیچ ادعایی را به‌عنوان حقیقت مستقل تأییدشده اعلام نکن. "
+        "سازگاری داخلی، عبارت‌های قطعی بدون شواهد، عدد/تاریخ نیازمند منبع، و محدودیت‌های متن را مشخص کن. "
+        "JSON معتبر با فیلدهای status (یکی از reported, needs_independent_source, internal_inconsistency, supplied_text_supports), "
+        "explanation و claims_to_check (آرایه کوتاه) بده. اگر شواهد کافی نداری، reported یا needs_independent_source را انتخاب کن.\n"
+        + json.dumps({"title": item.get("title", ""), "body": item.get("body", ""),
+                      "verification_current": item.get("verification", "reported"),
+                      "source_channels": item.get("source_channels", []), "source_urls": source_urls}, ensure_ascii=False)
+    )
+    try:
+        parsed, provider = ai_call_json(state, prompt, "admin_claim_review")
+        if not isinstance(parsed, dict):
+            raise ValueError("خروجی بررسی باید JSON باشد")
+        allowed = {"reported", "needs_independent_source", "internal_inconsistency", "supplied_text_supports"}
+        status = str(parsed.get("status", "reported"))
+        if status not in allowed:
+            status = "reported"
+        claims = parsed.get("claims_to_check", [])
+        if not isinstance(claims, list):
+            claims = []
+        review = {"ts": now_ts(), "provider": provider or "unknown", "status": status,
+                  "explanation": normalize_persian_text(str(parsed.get("explanation", "")))[:1200],
+                  "claims_to_check": [normalize_persian_text(str(x))[:240] for x in claims[:8]]}
+        item["verification_review"] = review
+        save_state(state)
+        record_admin_activity(state, user_id, "بازبینی AI ادعاهای خبر", f"{item.get('title','')} / {status} / {provider}")
+        labels = {"reported": "گزارش‌شده؛ تأیید مستقل انجام نشد", "needs_independent_source": "نیازمند منبع مستقل",
+                  "internal_inconsistency": "احتمال ناسازگاری داخلی", "supplied_text_supports": "متن فعلی از ادعا پشتیبانی می‌کند؛ نه تأیید بیرونی"}
+        lines = ["🔎 بازبینی ادعا با هوش مصنوعی", "", f"وضعیت: {labels[status]}", f"مدل: {provider or 'نامشخص'}",
+                 f"زمان: {now_tehran().strftime('%Y-%m-%d %H:%M')}", "", review["explanation"] or "توضیحی برنگشت.", "", "ادعاهای نیازمند بررسی:"]
+        lines.extend(["• " + x for x in review["claims_to_check"]] or ["• مورد مشخصی گزارش نشد."])
+        lines.extend(["", "محدودیت: این بررسی با متن/URLهای ثبت‌شده انجام شد و به‌خودی‌خود راستی‌آزمایی مستقل وب نیست."])
+        admin_render(chat_id, "\n".join(lines), [[admin_button("بازگشت به خبر", f"q|{item_id}")], [admin_button("مشاهده منابع", f"qsources|{item_id}")]], message_id)
+    except Exception as exc:
+        admin_render(chat_id, "بررسی AI انجام نشد: " + sanitize_error_text(exc), [[admin_button("بازگشت به خبر", f"q|{item_id}")]], message_id)
+
+
 def publish_queue_item_manually(state, item_id):
     if admin_settings(state).get("emergency_stop", False):
         raise RuntimeError("توقف اضطراری فعال است؛ ابتدا آن را از تنظیمات غیرفعال کن.")
     item = find_queue_item(state, item_id)
     if not item:
         raise RuntimeError("خبر موردنظر دیگر در صف نیست.")
+    if item.get("delivery_status") in {"sending", "uncertain", "partial", "sent"}:
+        raise RuntimeError("وضعیت ارسال این خبر نامشخص/ناقص است؛ ابتدا در صفحه خبر از گزینه حل وضعیت استفاده کن تا احتمال انتشار تکراری کاهش یابد.")
     if is_test_mode(state):
         dispatch_item(item, state=state)
         return False, "حالت آزمایشی روشن است؛ هیچ پستی در کانال منتشر نشد و خبر در صف ماند."
-    result = dispatch_item(item, state=state)
+    # انتشار فوری مدیر یک اقدام صریح است؛ نتیجه هر تلاش پیش از تماس با Telegram ذخیره می‌شود.
+    item["delivery_status"] = "sending"
+    item["delivery_started_ts"] = now_ts()
+    item["delivery_attempts"] = safe_int(item.get("delivery_attempts", 0), 0) + 1
+    item["manual_approval_required"] = False
+    save_state(state)
+    try:
+        result = dispatch_item(item, state=state)
+    except Exception as exc:
+        item["delivery_status"] = "uncertain" if not getattr(exc, "partial_message_ids", []) else "partial"
+        item["_delivery_message_ids"] = getattr(exc, "partial_message_ids", [])
+        item["delivery_error"] = sanitize_error_text(exc)[:240]
+        item["delivery_uncertain_ts"] = now_ts()
+        save_state(state)
+        raise
     if isinstance(result, dict) and result.get("test_mode"):
+        item["delivery_status"] = "queued"
+        save_state(state)
         return False, "حالت آزمایشی روشن است؛ خبری منتشر نشد."
     queue = state.get("_pending_queue", [])
     state["_pending_queue"] = [x for x in queue if x.get("admin_id") != item_id]
+    if str(state.get("_priority_pin_id", "")) == str(item_id):
+        state["_priority_pin_id"] = ""
     mark_posted_region(state, item)
     remember_item(state, item)
     record_published_item(state, item, result, manual=True)
     state["_last_queue_release_ts"] = now_ts()
     save_state(state)
     return True, "خبر با موفقیت منتشر شد."
-
 
 def set_admin_session(state, user_id, session):
     state.setdefault("_admin_sessions", {})[str(user_id)] = session
@@ -4865,67 +4990,17 @@ def handle_admin_text(state, user_id, chat_id, text):
         if text.startswith("/admin"):
             admin_show_menu(chat_id, role=admin_role(state, user_id))
         elif text.startswith("/find"):
-            msgid = safe_int(text.split(maxsplit=1)[1] if len(text.split(maxsplit=1)) > 1 else -1, -1)
-            item = next((x for x in state.get("_published_history", []) if safe_int(x.get("message_id"), 0) == msgid), None)
-            if item: admin_render(chat_id, f"🧾 پیام {msgid}\n{item.get('title','')}\nAI: {item.get('ai_provider','نامشخص')}\nمنابع: {', '.join(item.get('source_channels', [])) or 'نامشخص'}", [[admin_button("تاریخچه", "history")]])
-            else: admin_render(chat_id, "message_id در تاریخچه محلی پیدا نشد.", [[admin_button("تاریخچه", "history")]])
+            bits = text.split(maxsplit=1)
+            if len(bits) != 2 or not bits[1].strip().isdigit():
+                admin_render(chat_id, "قالب دستور: /find 12345", [[admin_button("V5.3", "v53")]])
+            else:
+                render_find_message(state, chat_id, bits[1].strip())
+        elif text.startswith("/exportcsv"):
+            send_history_csv(state, chat_id)
         return
     mode = session.get("type")
     try:
-        if mode == "schedule_exact":
-            item = find_queue_item(state, session.get("item_id"))
-            if not item: raise RuntimeError("خبر از صف حذف شده است.")
-            dt = datetime.strptime(text, "%Y-%m-%d %H:%M").replace(tzinfo=TEHRAN_TZ or timezone.utc)
-            if dt.timestamp() <= now_ts(): raise ValueError("زمان باید در آینده باشد.")
-            item["scheduled_at"] = dt.timestamp(); save_state(state); clear_admin_session(state, user_id)
-            admin_render(chat_id, "✅ زمان دقیق انتشار ذخیره شد.", [[admin_button("بازگشت به خبر", f"q|{item.get('admin_id')}")]])
-        elif mode == "pause_duration":
-            if text.lower() in {"1h", "1", "یک ساعت"}: state["_paused_until"] = now_ts() + 3600; state["_pause_until_important"] = False
-            elif text.lower() in {"tomorrow", "فردا", "تا فردا صبح"}:
-                dt = now_tehran().replace(hour=8, minute=0, second=0, microsecond=0)
-                if dt.timestamp() <= now_ts(): dt += timedelta(days=1)
-                state["_paused_until"] = dt.timestamp(); state["_pause_until_important"] = False
-            elif text.lower() in {"important", "مهم", "تا خبر مهم بعدی"}: state["_paused_until"] = 0; state["_pause_until_important"] = True
-            else: raise ValueError("یکی از گزینه‌های 1h، tomorrow یا important را بفرست.")
-            save_state(state); clear_admin_session(state, user_id); admin_render(chat_id, "⏸ توقف زمان‌دار ذخیره شد.", [[admin_button("▶️ ادامه", "resume")], [admin_button("تنظیمات", "settings")]])
-        elif mode == "block_words":
-            state["_blocked_keywords"] = [] if text.upper() == "CLEAR" else [x.strip() for x in text.split(",") if x.strip()][:100]
-            save_state(state); clear_admin_session(state, user_id); admin_render(chat_id, f"✅ فهرست مسدودسازی ذخیره شد ({len(state['_blocked_keywords'])} واژه).", [[admin_button("تنظیمات", "settings")]])
-        elif mode == "priority_words":
-            state["_priority_keywords"] = [] if text.upper() == "CLEAR" else [x.strip() for x in text.split(",") if x.strip()][:100]
-            save_state(state); clear_admin_session(state, user_id); admin_render(chat_id, f"✅ واژه‌های اولویت‌دار ذخیره شد ({len(state['_priority_keywords'])} واژه).", [[admin_button("تنظیمات", "settings")]])
-        elif mode == "topic_silence":
-            if text.upper() == "CLEAR":
-                state["_topic_silences"] = {}
-            else:
-                parts = [x.strip() for x in text.rsplit(",", 1)]
-                if len(parts) != 2 or not parts[0]: raise ValueError("قالب باید موضوع,ساعت باشد؛ مثال Ukraine,24.")
-                hours = safe_int(parts[1], 0)
-                if not 1 <= hours <= 168: raise ValueError("مدت سکوت باید بین ۱ تا ۱۶۸ ساعت باشد.")
-                state.setdefault("_topic_silences", {})[parts[0]] = now_ts() + hours * 3600
-            save_state(state); clear_admin_session(state, user_id); admin_render(chat_id, "✅ سکوت موضوعی ذخیره شد.", [[admin_button("تنظیمات", "settings")]])
-        elif mode == "history_search":
-            query = normalize_for_match(text); matches = [x for x in reversed(state.get("_published_history", [])) if query in normalize_for_match(x.get("title", "") + " " + x.get("body", ""))]
-            lines = [f"🔎 نتیجه جستجو: {len(matches)} مورد"]
-            for item in matches[:15]: lines.append(f"• {item.get('message_id','—')} | {item.get('title','')[:100]} | AI: {item.get('ai_provider','نامشخص')}")
-            clear_admin_session(state, user_id); admin_render(chat_id, "\n".join(lines), [[admin_button("تاریخچه", "history")]])
-        elif mode == "find_message_id":
-            msgid = safe_int(text, -1); item = next((x for x in state.get("_published_history", []) if safe_int(x.get("message_id"), 0) == msgid), None)
-            clear_admin_session(state, user_id)
-            if item: admin_render(chat_id, f"🧾 پیام {msgid}\nتیتر: {item.get('title','')}\nAI: {item.get('ai_provider','نامشخص')}\nمنابع: {', '.join(item.get('source_channels', [])) or 'نامشخص'}\nامتیاز: {item.get('news_score','—')}", [[admin_button("بازگشت به تاریخچه", "history")]])
-            else: admin_render(chat_id, "این message_id در تاریخچه محلی پیدا نشد.", [[admin_button("تاریخچه", "history")]])
-        elif mode == "rewrite_style":
-            item = find_queue_item(state, session.get("item_id"))
-            if not item: raise RuntimeError("خبر از صف حذف شده است.")
-            style = text.lower()
-            if style not in {"کوتاه‌تر", "رسمی‌تر", "با زمینه بیشتر", "shorter", "formal", "context"}: raise ValueError("یکی از سبک‌های کوتاه‌تر، رسمی‌تر یا با زمینه بیشتر را بفرست.")
-            style_instruction = {"کوتاه‌تر":"خبر را به حدود نصف طول فعلی کوتاه کن؛ اطلاعات مهم را حفظ کن.", "shorter":"خبر را به حدود نصف طول فعلی کوتاه کن؛ اطلاعات مهم را حفظ کن.", "رسمی‌تر":"متن را رسمی‌تر و حرفه‌ای‌تر بازنویسی کن، بدون افزودن واقعیت.", "formal":"متن را رسمی‌تر و حرفه‌ای‌تر بازنویسی کن، بدون افزودن واقعیت.", "با زمینه بیشتر":"زمینه را فقط با اطلاعات موجود در متن فعلی روشن‌تر کن؛ واقعیت تازه نساز.", "context":"زمینه را فقط با اطلاعات موجود در متن فعلی روشن‌تر کن؛ واقعیت تازه نساز."}[style]
-            prompt = "خبر فارسی را طبق دستور زیر بازنویسی کن و فقط JSON با کلیدهای title و body بده. " + style_instruction + "\n" + json.dumps({"title":item.get("title",""),"body":item.get("body","")}, ensure_ascii=False)
-            parsed, provider = ai_call_json(state, prompt, "admin_rewrite", preferred_order=runtime_provider_order(state))
-            if not parsed.get("title") or not parsed.get("body"): raise ValueError("خروجی بازنویسی معتبر نبود.")
-            item["title"] = normalize_persian_text(str(parsed["title"]))[:240]; item["body"] = normalize_persian_text(str(parsed["body"]))[:6500]; item["ai_provider"] = provider or item.get("ai_provider", "unknown"); item["fingerprint"] = item_fingerprint(item)
-            save_state(state); clear_admin_session(state, user_id); admin_render(chat_id, "✅ خبر بازنویسی شد.", [[admin_button("پیش‌نمایش", f"q|{item.get('admin_id')}")]])
-        elif mode == "edit_text":
+        if mode == "edit_text":
             item = find_queue_item(state, session.get("item_id"))
             if not item:
                 raise RuntimeError("خبر از صف حذف شده است.")
@@ -4995,6 +5070,117 @@ def handle_admin_text(state, user_id, chat_id, text):
             record_admin_activity(state, user_id, "تغییر رسانه خبر", item.get("title", ""))
             clear_admin_session(state, user_id)
             admin_render(chat_id, "✅ رسانه خبر به‌روزرسانی شد.", [[admin_button("پیش‌نمایش خبر", f"q|{item.get('admin_id')}")], [admin_button("صف انتشار", "queue")]])
+        elif mode == "schedule_exact":
+            item = find_queue_item(state, session.get("item_id"))
+            if not item:
+                raise RuntimeError("خبر از صف حذف شده است.")
+            if item.get("delivery_status") in {"sending", "uncertain", "partial", "sent"}:
+                raise RuntimeError("ابتدا وضعیت انتشار نامشخص/ناقص را از صفحه خبر حل کن؛ زمان‌بندی به‌تنهایی نباید ارسال را دوباره فعال کند.")
+            try:
+                dt = datetime.strptime(text, "%Y-%m-%d %H:%M")
+                dt = dt.replace(tzinfo=TEHRAN_TZ or timezone.utc)
+            except ValueError:
+                raise ValueError("قالب معتبر نیست. نمونه: 2026-10-20 21:30")
+            if dt.timestamp() <= now_ts():
+                raise ValueError("زمان انتشار باید در آینده باشد.")
+            item["scheduled_at"] = dt.timestamp()
+            item["delivery_status"] = "queued"
+            save_state(state); record_admin_activity(state, user_id, "زمان‌بندی دقیق", f"{item.get('title','')} — {text}")
+            clear_admin_session(state, user_id)
+            admin_render(chat_id, f"✅ زمان دقیق ذخیره شد: {dt.strftime('%Y-%m-%d %H:%M')}", [[admin_button("پیش‌نمایش خبر", f"q|{item.get('admin_id')}")], [admin_button("صف", "queue")]])
+        elif mode == "block_term":
+            term = normalize_space(text).lower()
+            if len(term) < 2: raise ValueError("واژه باید حداقل دو نویسه داشته باشد.")
+            terms = state.setdefault("_blocklist_terms", [])
+            if term not in terms: terms.append(term)
+            state["_blocklist_terms"] = terms[-300:]
+            save_state(state); clear_admin_session(state, user_id); render_terms(state, chat_id)
+        elif mode == "priority_term":
+            term = normalize_space(text).lower()
+            if len(term) < 2: raise ValueError("واژه باید حداقل دو نویسه داشته باشد.")
+            terms = state.setdefault("_priority_keywords", [])
+            if term not in terms: terms.append(term)
+            state["_priority_keywords"] = terms[-300:]
+            save_state(state); clear_admin_session(state, user_id); render_terms(state, chat_id)
+        elif mode == "topic_silence":
+            parts_in = [x.strip() for x in text.rsplit(",", 1)]
+            if len(parts_in) != 2: raise ValueError("قالب: عبارت,ساعت")
+            term, hours_text = parts_in
+            hours = safe_int(hours_text, 0)
+            if not term or not 1 <= hours <= 720: raise ValueError("مدت باید بین ۱ تا ۷۲۰ ساعت باشد.")
+            silences = state.setdefault("_topic_silences", [])
+            silences.append({"term": term, "created_ts": now_ts(), "until_ts": now_ts() + hours * 3600})
+            state["_topic_silences"] = silences[-200:]
+            save_state(state); clear_admin_session(state, user_id); render_terms(state, chat_id)
+        elif mode == "auto_rule_add":
+            groups = []
+            for group_text in re.split(r"\s+OR\s+", text, flags=re.I):
+                group = {"min_score": None, "source": "", "bucket": "", "region": ""}
+                for condition in [x.strip() for x in group_text.split(";") if x.strip()]:
+                    low = condition.lower()
+                    if low.startswith("score>="):
+                        score = safe_int(condition.split(">=", 1)[1].strip(), -1)
+                        if not 0 <= score <= 100: raise ValueError("امتیاز باید بین ۰ تا ۱۰۰ باشد.")
+                        group["min_score"] = score
+                    elif low.startswith("source="):
+                        group["source"] = condition.split("=", 1)[1].strip().lstrip("@")
+                    elif low.startswith("bucket="):
+                        group["bucket"] = condition.split("=", 1)[1].strip()
+                    elif low.startswith("region="):
+                        group["region"] = condition.split("=", 1)[1].strip()
+                    else: raise ValueError(f"شرط نامعتبر: {condition}")
+                if group["min_score"] is None: raise ValueError("در هر گروه OR شرط score>=... الزامی است.")
+                groups.append(group)
+            rule = {"id": sha1_text(f"{now_ts()}|{text}")[:8], "enabled": True, "created_ts": now_ts(), "groups": groups}
+            if len(groups) == 1: rule.update(groups[0])
+            rules = state.setdefault("_auto_approve_rules", []); rules.append(rule); state["_auto_approve_rules"] = rules[-100:]
+            save_state(state); clear_admin_session(state, user_id); record_admin_activity(state, user_id, "افزودن قانون تأیید خودکار", text)
+            render_auto_rules(state, chat_id)
+        elif mode == "history_search":
+            filters = {}
+            free_terms = []
+            for token in text.split():
+                if "=" in token and token.split("=", 1)[0].lower() in {"source", "bucket", "date", "region", "ai", "id"}:
+                    key, value = token.split("=", 1); filters[key.lower()] = normalize_for_match(value)
+                else:
+                    free_terms.append(token)
+            query = normalize_for_match(" ".join(free_terms))
+            matches = []
+            for rec in reversed(state.get("_published_history", [])):
+                stamp = datetime.fromtimestamp(safe_float(rec.get("ts"), 0), TEHRAN_TZ or timezone.utc).strftime("%Y-%m-%d") if safe_float(rec.get("ts"), 0) else ""
+                if filters.get("source") and filters["source"] not in normalize_for_match(" ".join(rec.get("source_channels", []))): continue
+                if filters.get("bucket") and filters["bucket"] not in normalize_for_match(rec.get("content_bucket", "")): continue
+                if filters.get("date") and filters["date"] not in normalize_for_match(stamp): continue
+                if filters.get("region") and filters["region"] not in normalize_for_match(rec.get("region", "")): continue
+                if filters.get("ai") and filters["ai"] not in normalize_for_match(rec.get("ai_provider", "")): continue
+                if filters.get("id") and filters["id"] not in normalize_for_match(" ".join([str(rec.get("message_id", "")), " ".join(str(x) for x in rec.get("message_ids", []))])): continue
+                haystack = normalize_for_match(" ".join([str(rec.get("title", "")), str(rec.get("body", "")), str(rec.get("ai_provider", "")), " ".join(rec.get("source_channels", [])), str(rec.get("content_bucket", "")), str(rec.get("message_id", ""))]))
+                if not query or query in haystack or filters:
+                    matches.append(rec)
+            clear_admin_session(state, user_id)
+            render_history_search_results(state, chat_id, text, matches[:20])
+        elif mode == "rewrite_queue":
+            item = find_queue_item(state, session.get("item_id"))
+            if not item: raise RuntimeError("خبر از صف حذف شده است.")
+            style_prompt = {
+                "کوتاه‌تر": "خبر را کوتاه‌تر کن و اطلاعات قطعی را حفظ کن.",
+                "رسمی‌تر": "خبر را رسمی‌تر و دقیق‌تر بازنویسی کن.",
+                "با زمینه بیشتر": "فقط زمینه‌ای را اضافه کن که از متن موجود پشتیبانی می‌شود؛ واقعیت جدید نساز.",
+                "تیتر بهتر": "فقط تیتر را به شکل روشن‌تر و دقیق‌تر اصلاح کن؛ بدنه را دست‌نخورده نگه دار.",
+            }.get(text.strip(), text.strip())
+            if len(style_prompt) < 3: raise ValueError("یک سبک معتبر وارد کن.")
+            parsed, provider = ai_call_json(state, "فقط یک JSON با title و body برگردان. نام‌ها، عددها و ادعاها را تغییر نده. دستور: " + style_prompt + "\nتیتر: " + item.get("title", "") + "\nمتن: " + item.get("body", ""), "admin_rewrite")
+            new_title = normalize_persian_text(str(parsed.get("title", "") if isinstance(parsed, dict) else ""))
+            new_body = normalize_persian_text(str(parsed.get("body", "") if isinstance(parsed, dict) else ""))
+            if not new_title or not new_body: raise ValueError("خروجی بازنویسی قابل استفاده نبود؛ متن تغییری نکرد.")
+            item.setdefault("versions", []).append({"ts": now_ts(), "title": item.get("title", ""), "body": item.get("body", ""), "provider": provider})
+            item["versions"] = item["versions"][-20:]
+            item["title"], item["body"] = new_title[:240], new_body[:6500]
+            item["ai_provider_editor"] = provider or "unknown"
+            item["ai_provider"] = f"{item.get('ai_provider_stage1', 'unknown')} + admin_rewrite:{provider or 'unknown'}"
+            item["fingerprint"] = item_fingerprint(item)
+            save_state(state); clear_admin_session(state, user_id); record_admin_activity(state, user_id, "بازنویسی AI خبر", f"{item.get('title','')} / {provider}")
+            admin_render(chat_id, f"✅ خبر بازنویسی شد با {provider or 'AI نامشخص'}.", [[admin_button("پیش‌نمایش", f"q|{item.get('admin_id')}")], [admin_button("صف", "queue")]])
         elif mode == "schedule_delay":
             delay = safe_int(text, -1)
             if delay < 0 or delay > 10080:
@@ -5165,6 +5351,21 @@ def admin_confirm_action(state, user_id, chat_id, action, object_id, message_id=
             admin_render(chat_id, "منبع حذف نشد؛ دست‌کم یک منبع باید باقی بماند.", [[admin_button("منابع", "sources")]], message_id)
 
 
+def _resolve_uncertain_as_sent(state, user_id, chat_id, item, item_id, ids, message_id=None):
+    synthetic_result = {"result": {"message_id": (ids[0] if ids else safe_int(item.get("message_id"), 0))}, "_all_message_ids": ids}
+    queue = state.get("_pending_queue", [])
+    state["_pending_queue"] = [x for x in queue if str(x.get("admin_id", "")) != str(item_id)]
+    if str(state.get("_priority_pin_id", "")) == str(item_id): state["_priority_pin_id"] = ""
+    mark_posted_region(state, item)
+    remember_item(state, item)
+    record_published_item(state, item, synthetic_result, manual=True)
+    state["_last_queue_release_ts"] = now_ts()
+    save_state(state)
+    record_admin_activity(state, user_id, "تأیید دستی انتشار با نتیجه نامشخص", item.get("title", ""))
+    suffix = (", ".join(str(x) for x in ids) if ids else "بدون شناسه پیام؛ تأیید دستی مدیر")
+    admin_render(chat_id, "✅ رکورد به‌عنوان منتشرشده ثبت شد و از صف خارج شد. شناسه‌ها: " + suffix, [[admin_button("تاریخچه", "history")], [admin_button("صف", "queue")]], message_id)
+
+
 def handle_admin_callback(state, user_id, chat_id, callback, role):
     data = str(callback.get("data", ""))
     msg = callback.get("message", {})
@@ -5176,19 +5377,183 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
     area_by_action = {
         "menu": "stats", "stats": "stats", "settings": "settings", "setting": "settings", "setprompt": "settings",
         "news": "history_view" if role == "observer" else "news", "queue": "queue", "queuepage": "queue",
-        "q": "queue", "qedit": "queue", "qimg": "queue", "qdelay": "queue", "qpub": "queue", "qdel": "queue", "qbump": "queue", "qbottom": "queue", "qpin": "queue", "qrewrite": "queue", "qtime": "queue", "qsrc": "queue", "qfull": "queue", "qretry": "queue", "pause": "settings", "resume": "settings", "source_toggle": "sources", "source_stats": "sources", "blockwords": "settings", "historysearch": "history_view" if role == "observer" else "news", "findmsg": "history_view", "historycsv": "history_view" if role == "observer" else "news", "profile": "settings", "prioritywords": "settings", "topicsilence": "settings",
+        "q": "queue", "qedit": "queue", "qimg": "queue", "qdelay": "queue", "qpub": "queue", "qdel": "queue",
         "history": "history_view" if role == "observer" else "news", "historypage": "history_view" if role == "observer" else "news", "h": "history_view" if role == "observer" else "news",
         "hedit": "news", "himg": "news", "hdelete": "news", "ai": "ai_view" if role == "observer" else "ai", "aiprovider": "ai_view" if role == "observer" else "ai",
         "aienable": "ai", "aiprimary": "ai", "admins": "admins", "adminadd": "admins", "adminrole": "admins", "sources": "sources", "sourceadd": "sources",
         "logs": "logs", "decisions": "decisions", "tools": "diagnose" if role == "observer" else "tools", "diagnose": "diagnose", "testmode": "tools", "dedupqueue": "queue", "confirm": "settings",
         "aitest": "ai", "primary": "ai", "do": "stats",
+        "v53": "tools", "pause": "tools", "resume": "tools", "profile": "tools",
+        "blockadd": "tools", "keyadd": "tools", "silenceadd": "tools", "sourcetoggle": "sources",
+        "sourcestats": "sources", "metrics": "tools", "historysearch": "news", "exportcsv": "news",
+        "qexact": "queue", "qbump": "queue", "qpin": "queue", "qrewrite": "queue", "qrewritecustom": "queue", "qsources": "queue", "qresolve": "queue", "qverify": "queue",
+        "find": "news", "terms": "tools", "ruleadd": "tools", "rules": "tools", "ruletoggle": "tools", "ruledelete": "tools", "rulesgate": "tools", "qapprove": "queue",
     }
     area = area_by_action.get(action, "stats")
     if not admin_can(role, area):
         admin_render(chat_id, "این سطح دسترسی اجازه این عملیات را ندارد.", [[admin_button("منوی اصلی", "menu")]], message_id)
         return
 
-    if action == "menu":
+    if action == "v53":
+        render_v53_menu(state, chat_id, message_id)
+    elif action == "pause" and len(parts) > 1:
+        pause_mode = parts[1]
+        if pause_mode == "1h":
+            state["_paused_until"] = now_ts() + 3600; state["_pause_until_important"] = False
+        elif pause_mode == "tomorrow":
+            tomorrow = now_tehran().date() + timedelta(days=1)
+            target = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 7, 0, tzinfo=TEHRAN_TZ or timezone.utc)
+            state["_paused_until"] = target.timestamp(); state["_pause_until_important"] = False
+        elif pause_mode == "important":
+            state["_paused_until"] = 0; state["_pause_until_important"] = True
+        save_state(state); record_admin_activity(state, user_id, "توقف زمان‌دار", pause_mode)
+        render_v53_menu(state, chat_id, message_id)
+    elif action == "resume":
+        state["_paused_until"] = 0; state["_pause_until_important"] = False
+        save_state(state); record_admin_activity(state, user_id, "ادامه انتشار", "پنل V5.3")
+        render_v53_menu(state, chat_id, message_id)
+    elif action == "profile" and len(parts) > 1:
+        profile = parts[1]
+        st = admin_settings(state)
+        if profile == "war":
+            st.update({"active_start_hour": 0, "afternoon_start_hour": 14, "active_end_hour": 24,
+                       "morning_spacing_minutes": 20, "afternoon_spacing_minutes": 20})
+            state["_profile"] = "war"
+        else:
+            st.update({"active_start_hour": 8, "afternoon_start_hour": 14, "active_end_hour": 24,
+                       "morning_spacing_minutes": MORNING_POST_SPACING_MINUTES,
+                       "afternoon_spacing_minutes": AFTERNOON_POST_SPACING_MINUTES})
+            state["_profile"] = "normal"
+        save_state(state); record_admin_activity(state, user_id, "تغییر پروفایل", profile)
+        render_v53_menu(state, chat_id, message_id)
+    elif action == "blockadd":
+        ask_admin_input(state, user_id, chat_id, {"type": "block_term"}, "واژه/عبارت ممنوع را بفرست؛ پست خام دارای این عبارت پیش از AI رد می‌شود.", message_id)
+    elif action == "keyadd":
+        ask_admin_input(state, user_id, chat_id, {"type": "priority_term"}, "واژه/عبارت اولویت‌دار را بفرست؛ خبرهای منطبق امتیاز اولویت می‌گیرند.", message_id)
+    elif action == "silenceadd":
+        ask_admin_input(state, user_id, chat_id, {"type": "topic_silence"}, "قالب: عبارت,ساعت — نمونه: موشک بالستیک,24. انتشار موارد دارای این عبارت تا پایان مدت متوقف می‌شود.", message_id)
+    elif action == "terms":
+        render_terms(state, chat_id, message_id)
+    elif action == "rules":
+        render_auto_rules(state, chat_id, message_id)
+    elif action == "ruleadd":
+        ask_admin_input(state, user_id, chat_id, {"type": "auto_rule_add"}, "قالب: score>=85;source=ChannelName;bucket=iran OR score>=95;region=iran. در هر گروه شرط‌ها با AND هستند و بین گروه‌ها OR است. score>=... در هر گروه الزامی است.", message_id)
+    elif action == "rulesgate":
+        state["_rules_gate_enabled"] = not safe_bool(state.get("_rules_gate_enabled"))
+        save_state(state); record_admin_activity(state, user_id, "تغییر حالت گیت قوانین", str(state["_rules_gate_enabled"]))
+        render_auto_rules(state, chat_id, message_id)
+    elif action == "ruletoggle" and len(parts) > 1:
+        rule_id = parts[1]
+        for rule in state.get("_auto_approve_rules", []):
+            if str(rule.get("id")) == rule_id: rule["enabled"] = not safe_bool(rule.get("enabled", True))
+        save_state(state); render_auto_rules(state, chat_id, message_id)
+    elif action == "ruledelete" and len(parts) > 1:
+        state["_auto_approve_rules"] = [x for x in state.get("_auto_approve_rules", []) if str(x.get("id")) != parts[1]]
+        save_state(state); render_auto_rules(state, chat_id, message_id)
+    elif action == "qresolve" and len(parts) > 2:
+        item_id, resolution = parts[1], parts[2]
+        item = find_queue_item(state, item_id)
+        if not item:
+            admin_render(chat_id, "خبر در صف پیدا نشد.", [[admin_button("صف", "queue")]], message_id)
+        elif item.get("delivery_status") not in {"uncertain", "partial"}:
+            admin_render(chat_id, "این خبر وضعیت نامشخص/ناقص ندارد؛ تغییری انجام نشد.", [[admin_button("بازگشت به خبر", f"q|{item_id}")]], message_id)
+        elif resolution == "retry":
+            item["delivery_status"] = "queued"
+            item["delivery_error"] = ""
+            item["delivery_uncertain_ts"] = 0
+            item["_delivery_message_ids"] = []
+            item["scheduled_at"] = 0
+            save_state(state)
+            record_admin_activity(state, user_id, "اجازه تلاش مجدد برای ارسال نامشخص", item.get("title", ""))
+            admin_render(chat_id, "⚠️ خبر برای تلاش مجدد مجاز شد. اگر بخش‌هایی قبلاً در کانال منتشر شده باشند، امکان تکرار وجود دارد.", [[admin_button("بازکردن خبر", f"q|{item_id}")], [admin_button("صف", "queue")]], message_id)
+        elif resolution == "sent":
+            ids = [safe_int(x, 0) for x in item.get("_delivery_message_ids", []) if safe_int(x, 0)]
+            if not ids and not item.get("message_id"):
+                admin_render(chat_id, "هیچ شناسه پیامی ثبت نشده است. اگر کانال را بررسی کردی و مطمئنی پیام منتشر شده، می‌توانی فقط رکورد محلی را بدون شناسه ثبت کنی.", [[admin_button("✅ تأیید انتشار بدون شناسه", f"qresolve|{item_id}|sent_force")], [admin_button("بازگشت به خبر", f"q|{item_id}")]], message_id)
+            else:
+                _resolve_uncertain_as_sent(state, user_id, chat_id, item, item_id, ids, message_id)
+        elif resolution == "sent_force":
+            item = find_queue_item(state, item_id)
+            if item and item.get("delivery_status") in {"uncertain", "partial"}:
+                ids = [safe_int(x, 0) for x in item.get("_delivery_message_ids", []) if safe_int(x, 0)]
+                _resolve_uncertain_as_sent(state, user_id, chat_id, item, item_id, ids, message_id)
+            else:
+                admin_render(chat_id, "خبر در وضعیت قابل حل نیست.", [[admin_button("صف", "queue")]], message_id)
+        else:
+            admin_render(chat_id, "گزینه حل وضعیت ناشناخته است.", [[admin_button("بازگشت به خبر", f"q|{item_id}")]], message_id)
+    elif action == "qapprove" and len(parts) > 1:
+        item = find_queue_item(state, parts[1])
+        if not item:
+            admin_render(chat_id, "خبر پیدا نشد.", [[admin_button("صف", "queue")]], message_id)
+        else:
+            item["manual_approval_required"] = False; item["manual_review_approved_by"] = user_id; item["manual_review_approved_ts"] = now_ts()
+            save_state(state); record_admin_activity(state, user_id, "تأیید دستی خبر", item.get("title", ""))
+            render_queue_item(state, chat_id, parts[1], message_id)
+    elif action == "metrics":
+        render_performance(state, chat_id, message_id)
+    elif action == "sourcestats":
+        render_source_stats(state, chat_id, message_id)
+    elif action == "sourcetoggle" and len(parts) > 1:
+        source = str(parts[1]).strip().lstrip("@")
+        disabled = set(state.get("_disabled_sources", []))
+        if source in disabled: disabled.remove(source)
+        else: disabled.add(source)
+        state["_disabled_sources"] = sorted(disabled)
+        save_state(state); record_admin_activity(state, user_id, "تغییر وضعیت منبع", f"{source}: {'فعال' if source not in disabled else 'غیرفعال'}")
+        render_sources(state, chat_id, message_id)
+    elif action == "historysearch":
+        ask_admin_input(state, user_id, chat_id, {"type": "history_search"}, "عبارت جست‌وجو را بفرست. جست‌وجو در تیتر، متن، نام منبع، bucket و شناسه پیام انجام می‌شود.", message_id)
+    elif action == "exportcsv":
+        send_history_csv(state, chat_id)
+        admin_render(chat_id, "✅ فایل CSV تاریخچه آماده شد.", [[admin_button("بازگشت به V5.3", "v53")]], message_id)
+    elif action == "find" and len(parts) > 1:
+        render_find_message(state, chat_id, parts[1], message_id)
+    elif action == "qexact" and len(parts) > 1:
+        ask_admin_input(state, user_id, chat_id, {"type": "schedule_exact", "item_id": parts[1]}, "تاریخ و ساعت را به وقت تهران وارد کن؛ قالب دقیق: YYYY-MM-DD HH:MM (مثال: 2026-10-20 21:30).", message_id)
+    elif action == "qbump" and len(parts) > 2:
+        item_id, where = parts[1], parts[2]
+        item = find_queue_item(state, item_id)
+        if not item:
+            admin_render(chat_id, "خبر در صف پیدا نشد.", [[admin_button("صف", "queue")]], message_id)
+        else:
+            if where == "top": item["manual_priority"] = 10000; item["queued_at"] = now_ts()
+            else: item["manual_priority"] = -10000; item["queued_at"] = now_ts() + 86400
+            save_state(state); record_admin_activity(state, user_id, "تغییر اولویت صف", f"{where}: {item.get('title','')}")
+            render_queue_item(state, chat_id, item_id, message_id)
+    elif action == "qpin" and len(parts) > 1:
+        item_id = parts[1]; item = find_queue_item(state, item_id)
+        if not item:
+            admin_render(chat_id, "خبر در صف پیدا نشد.", [[admin_button("صف", "queue")]], message_id)
+        else:
+            item["scheduled_at"] = 0; item["manual_priority"] = 20000
+            state["_priority_pin_id"] = item_id
+            save_state(state); record_admin_activity(state, user_id, "Pin خبر صف", item.get("title", ""))
+            render_queue_item(state, chat_id, item_id, message_id)
+    elif action == "qrewrite" and len(parts) > 1:
+        if len(parts) > 2:
+            rewrite_queue_item_with_style(state, user_id, chat_id, parts[1], parts[2], message_id)
+        else:
+            rows = [
+                [admin_button("کوتاه‌تر", f"qrewrite|{parts[1]}|short"), admin_button("رسمی‌تر", f"qrewrite|{parts[1]}|formal")],
+                [admin_button("با زمینه بیشتر", f"qrewrite|{parts[1]}|context"), admin_button("اصلاح تیتر", f"qrewrite|{parts[1]}|headline")],
+                [admin_button("واردکردن دستور دلخواه", f"qrewritecustom|{parts[1]}")],
+                [admin_button("⬅️ بازگشت به خبر", f"q|{parts[1]}")],
+            ]
+            admin_render(chat_id, "سبک بازنویسی را انتخاب کن. نسخه قبلی حفظ می‌شود و متن جدید باید پیش از انتشار بازبینی شود.", rows, message_id)
+    elif action == "qrewritecustom" and len(parts) > 1:
+        ask_admin_input(state, user_id, chat_id, {"type": "rewrite_queue", "item_id": parts[1]}, "دستور بازنویسی دلخواه را بنویس. نسخه قبلی حفظ می‌شود.", message_id)
+    elif action == "qverify" and len(parts) > 1:
+        review_queue_item_with_ai(state, user_id, chat_id, parts[1], message_id)
+    elif action == "qsources" and len(parts) > 1:
+        item = find_queue_item(state, parts[1])
+        if not item:
+            admin_render(chat_id, "خبر در صف پیدا نشد.", [[admin_button("صف", "queue")]], message_id)
+        else:
+            urls = item.get("source_urls", []) if isinstance(item.get("source_urls"), list) else []
+            lines = [f"منابع خبر: {item.get('title','')}", "", "کانال‌ها: " + (", ".join(item.get("source_channels", [])) or "ثبت نشده"), "پیوندها:"]
+            lines.extend(urls[:12] or ["پیوند مستقلی ثبت نشده است."])
+            admin_render(chat_id, "\n".join(lines), [[admin_button("⬅️ بازگشت به خبر", f"q|{parts[1]}")]], message_id)
+    elif action == "menu":
         clear_admin_session(state, user_id)
         admin_show_menu(chat_id, message_id, role)
     elif action == "stats": render_stats(state, chat_id, message_id)
@@ -5225,75 +5590,6 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
         ask_admin_input(state, user_id, chat_id, {"type": "edit_image", "item_id": parts[1]}, "یک عکس را همین‌جا ارسال کن یا URL عکس با http/https را بفرست؛ برای حذف رسانه علامت - را بفرست.", message_id)
     elif action == "qdelay" and len(parts) > 1:
         ask_admin_input(state, user_id, chat_id, {"type": "schedule_delay", "item_id": parts[1]}, "تأخیر انتشار را به دقیقه بفرست؛ ۰ یعنی در اولین فرصت مجاز.", message_id)
-    elif action == "qbump" and len(parts) > 1:
-        item = find_queue_item(state, parts[1])
-        if item:
-            queue = state.get("_pending_queue", []); queue.remove(item); queue.insert(0, item); item["scheduled_at"] = 0
-            record_admin_activity(state, user_id, "بالا بردن صف", item.get("title", "")); save_state(state); render_queue_item(state, chat_id, parts[1], message_id)
-    elif action == "qbottom" and len(parts) > 1:
-        item = find_queue_item(state, parts[1])
-        if item:
-            queue = state.get("_pending_queue", []); queue.remove(item); queue.append(item)
-            record_admin_activity(state, user_id, "انتقال به ته صف", item.get("title", "")); save_state(state); render_queue_item(state, chat_id, parts[1], message_id)
-    elif action == "qpin" and len(parts) > 1:
-        item = find_queue_item(state, parts[1])
-        if item:
-            state["_pinned_queue_id"] = str(item.get("admin_id", "")); item["scheduled_at"] = 0
-            record_admin_activity(state, user_id, "پین خبر برای انتشار بعدی", item.get("title", "")); save_state(state); render_queue_item(state, chat_id, parts[1], message_id)
-    elif action == "qretry" and len(parts) > 1:
-        item = find_queue_item(state, parts[1])
-        if item:
-            item["delivery_status"] = "queued"; item.pop("delivery_error", None); item["scheduled_at"] = 0
-            save_state(state); admin_render(chat_id, "خبر به صف عادی برگشت. اگر ارسال قبلی مبهم بوده، ابتدا کانال را بررسی کن تا تکراری نشود.", [[admin_button("بازگشت به خبر", f"q|{parts[1]}")]], message_id)
-    elif action == "qfull" and len(parts) > 1:
-        item = find_queue_item(state, parts[1])
-        if item: admin_render(chat_id, "🧾 متن کامل خبر\n\n" + item.get("title", "") + "\n\n" + item.get("body", ""), [[admin_button("بازگشت", f"q|{parts[1]}")]], message_id)
-    elif action == "qsrc" and len(parts) > 1:
-        item = find_queue_item(state, parts[1])
-        if item: admin_render(chat_id, "📚 منابع ثبت‌شده\n\n" + "\n".join(item.get("source_urls", []) or item.get("source_channels", []) or ["منبع ثبت‌شده‌ای نیست"]), [[admin_button("بازگشت", f"q|{parts[1]}")]], message_id)
-    elif action == "qtime" and len(parts) > 1:
-        ask_admin_input(state, user_id, chat_id, {"type": "schedule_exact", "item_id": parts[1]}, "زمان دقیق تهران را به قالب YYYY-MM-DD HH:MM بفرست؛ مثال 2026-10-18 21:30.", message_id)
-    elif action == "qrewrite" and len(parts) > 1:
-        ask_admin_input(state, user_id, chat_id, {"type": "rewrite_style", "item_id": parts[1]}, "سبک بازنویسی را بفرست: کوتاه‌تر / رسمی‌تر / با زمینه بیشتر. سپس خبر با AI بازنویسی می‌شود.", message_id)
-    elif action == "pause":
-        ask_admin_input(state, user_id, chat_id, {"type": "pause_duration"}, "توقف زمان‌دار را انتخاب کن: 1h ، tomorrow (تا ۸ صبح تهران) یا important (تا خبر مهم بعدی).", message_id)
-    elif action == "profile" and len(parts) > 1:
-        if parts[1] in {"war", "normal"}:
-            state["_profile"] = parts[1]; save_state(state)
-            record_admin_activity(state, user_id, "تغییر پروفایل انتشار", parts[1])
-            admin_render(chat_id, "پروفایل ذخیره شد: " + ("حالت جنگ؛ فاصله ۱۰ دقیقه و بدون ساعات سکوت" if parts[1] == "war" else "حالت عادی؛ مطابق برنامه انتشار تنظیم‌شده"), [[admin_button("تنظیمات", "settings")]])
-    elif action == "resume":
-        state["_paused_until"] = 0; state["_pause_until_important"] = False; save_state(state); render_settings(state, chat_id, message_id)
-    elif action == "source_toggle" and len(parts) > 1:
-        src = parts[1]; enabled = state.setdefault("_source_enabled", {}); enabled[src] = not enabled.get(src, True); save_state(state); render_sources(state, chat_id, message_id)
-    elif action == "source_stats":
-        lines = ["📡 عملکرد منابع"]
-        for src, metric in sorted(state.get("_source_metrics", {}).items()): lines.append(f"• {src}: دریافت {metric.get('fetched',0)} | منتشرشده {metric.get('published',0)} | خطا {metric.get('errors',0)}")
-        admin_render(chat_id, "\n".join(lines), [[admin_button("بازگشت", "sources")]], message_id)
-    elif action == "blockwords":
-        ask_admin_input(state, user_id, chat_id, {"type": "block_words"}, "واژه‌های مسدودشده را با کاما جدا کن. برای پاک‌کردن همه، فقط CLEAR بفرست.", message_id)
-    elif action == "prioritywords":
-        ask_admin_input(state, user_id, chat_id, {"type": "priority_words"}, "واژه‌های اولویت‌دار را با کاما جدا کن. برای پاک‌کردن همه CLEAR بفرست.", message_id)
-    elif action == "topicsilence":
-        ask_admin_input(state, user_id, chat_id, {"type": "topic_silence"}, "موضوع و مدت ساعت را به شکل موضوع,24 وارد کن؛ برای مثال Ukraine,24. برای حذف همه سکوت‌ها CLEAR بفرست.", message_id)
-    elif action == "historysearch":
-        ask_admin_input(state, user_id, chat_id, {"type": "history_search"}, "عبارت جستجو را وارد کن. در تاریخچه ثبت‌شده جستجو می‌شود.", message_id)
-    elif action == "historycsv":
-        import csv, tempfile
-        fd, csv_path = tempfile.mkstemp(prefix="raptor-history-", suffix=".csv")
-        os.close(fd)
-        try:
-            write_history_csv(state, csv_path)
-            with open(csv_path, "rb") as f:
-                telegram_request("sendDocument", data={"chat_id": chat_id, "caption": "تاریخچه محلی رپتور؛ شامل رکوردهای ذخیره‌شده در state."}, files={"document": ("raptor_history.csv", f, "text/csv")}, timeout=60)
-            admin_render(chat_id, "✅ خروجی CSV ارسال شد.", [[admin_button("تاریخچه", "history")]], message_id)
-        except Exception as exc:
-            admin_render(chat_id, "خروجی CSV ناموفق بود: " + sanitize_error_text(exc), [[admin_button("تاریخچه", "history")]], message_id)
-        finally:
-            try: os.unlink(csv_path)
-            except OSError: pass
-    elif action == "findmsg":
-        ask_admin_input(state, user_id, chat_id, {"type": "find_message_id"}, "message_id عددی پست کانال را بفرست.", message_id)
     elif action in {"history", "historypage"}: render_history(state, chat_id, message_id, safe_int(parts[1] if len(parts) > 1 and action == "historypage" else 0, 0))
     elif action == "h" and len(parts) > 1: render_history_item(state, chat_id, parts[1], message_id)
     elif action == "hedit" and len(parts) > 1:
@@ -5472,8 +5768,9 @@ def _handle_admin_update_unlocked(state, update):
     save_state(state)
 
 
+
 def handle_admin_update(state, update):
-    """Serialize admin mutations with the worker state transitions."""
+    # Panel operations update the same queue/settings/history as the publishing loop.
     with STATE_LOCK:
         return _handle_admin_update_unlocked(state, update)
 
@@ -5504,7 +5801,9 @@ def admin_poll_loop(state):
                     handle_admin_update(state, update)
                 except Exception as exc:
                     log.exception("پردازش یک رویداد پنل ناموفق بود: %s", sanitize_error_text(exc))
-                    record_system_error(state, "Admin", "پردازش رویداد تلگرام", exc)
+                    with STATE_LOCK:
+                        record_system_error(state, "Admin", "پردازش رویداد تلگرام", exc)
+                        save_state(state)
                 offset = max(offset, safe_int(update.get("update_id"), 0) + 1)
                 with STATE_LOCK:
                     state["_telegram_update_offset"] = offset
@@ -5513,14 +5812,415 @@ def admin_poll_loop(state):
             failures += 1
             log.warning("پنل مدیریت getUpdates: %s", sanitize_error_text(exc))
             if failures >= 3:
-                record_system_error(state, "Admin", "دریافت به‌روزرسانی تلگرام", exc)
-                save_state(state)
+                with STATE_LOCK:
+                    record_system_error(state, "Admin", "دریافت به‌روزرسانی تلگرام", exc)
+                    save_state(state)
                 failures = 0
                 time.sleep(10)
             else:
                 time.sleep(2)
 
 
+
+
+# ============================================================
+# v5.3 utilities: source controls, queue controls, reporting and alerts
+# ============================================================
+
+def is_blocked_or_silenced(state, text):
+    return bool(block_or_silence_reason(state, text))
+
+
+def block_or_silence_reason(state, text):
+    normalized = normalize_for_match(text)
+    for term in state.get("_blocklist_terms", []):
+        if normalize_for_match(term) and normalize_for_match(term) in normalized:
+            return f"عبارت ممنوع در فهرست بلاک‌لیست: {term}"
+    active = []
+    now = now_ts()
+    for entry in state.get("_topic_silences", []):
+        if not isinstance(entry, dict):
+            continue
+        if safe_float(entry.get("until_ts"), 0) <= now:
+            continue
+        term = normalize_for_match(entry.get("term", ""))
+        if term and term in normalized:
+            active.append(entry.get("term", term))
+    if active:
+        return "سکوت موضوعی موقت: " + ", ".join(active[:3])
+    return ""
+
+
+def cheap_classify_posts(state, posts):
+    """پیش‌فیلتر اختیاری Groq ارزان؛ خطای طبقه‌بند fail-open است تا خبر از دست نرود."""
+    if not CHEAP_CLASSIFIER_ENABLED or not posts or not GROQ_API_KEYS:
+        return posts
+    with STATE_LOCK:
+        classifier_stats = state.setdefault("_v53_classifier", {"seen": 0, "passed": 0, "rejected": 0, "errors": 0})
+        classifier_stats["seen"] = safe_int(classifier_stats.get("seen"), 0) + len(posts)
+        save_state(state)
+    rows = []
+    for i, post in enumerate(posts, 1):
+        post["_classifier_id"] = str(i)
+        rows.append({"id": str(i), "title": post.get("title", ""), "text": truncate_text(post.get("text", ""), 950)})
+    prompt = (
+        "Classify public Telegram posts for a Persian military/geopolitical news channel. "
+        "Keep only posts containing a substantive news event, official announcement, meaningful development, "
+        "equipment/defense technology update, or significant analysis. Reject ads, channel promotion, greetings, "
+        "unrelated entertainment, repeated boilerplate, and posts with no substantive information. "
+        "Do not decide truth; only relevance. Return strict JSON: {\"keep_ids\":[\"1\",\"2\"]}.\nINPUT="
+        + json.dumps(rows, ensure_ascii=False)
+    )
+    try:
+        response = requests.post(
+            GROQ_API_URL,
+            headers={"Authorization": f"Bearer {GROQ_API_KEYS[0]}", "Content-Type": "application/json"},
+            json={"model": CHEAP_CLASSIFIER_MODEL, "messages": [{"role": "user", "content": prompt}],
+                  "temperature": 0, "max_tokens": 300, "response_format": {"type": "json_object"}},
+            timeout=(8, 25),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
+        try:
+            parsed = json.loads(content)
+        except Exception:
+            match = re.search(r"\{.*\}", content, flags=re.S)
+            if not match:
+                raise ValueError("classifier JSON نامعتبر بود")
+            parsed = json.loads(match.group(0))
+        keep_ids = parsed.get("keep_ids") if isinstance(parsed, dict) else None
+        if not isinstance(keep_ids, list):
+            raise ValueError("classifier فهرست keep_ids برنگرداند")
+        keep = {str(x) for x in keep_ids}
+        kept, rejected = [], []
+        for post in posts:
+            if str(post.get("_classifier_id")) in keep:
+                post["classification_model"] = CHEAP_CLASSIFIER_MODEL
+                kept.append(post)
+            else:
+                rejected.append(post)
+                src_key = post.get("_source_key")
+                uid = post.get("uid")
+                if src_key and uid:
+                    with STATE_LOCK:
+                        entries = state.setdefault(src_key, [])
+                        if uid not in entries:
+                            entries.append(uid)
+                        state[src_key] = entries[-500:]
+                channel = str(src_key or "").removeprefix("tg:")
+                with STATE_LOCK:
+                    stat = state.setdefault("_source_stats", {}).setdefault(channel, {"fetched": 0, "new": 0, "published": 0, "rejected": 0, "errors": 0})
+                    stat["rejected"] = safe_int(stat.get("rejected"), 0) + 1
+                    record_decision(state, post.get("title") or post.get("text", "")[:140], "رد‌شده", f"پیش‌فیلتر ارزان {CHEAP_CLASSIFIER_MODEL}: فاقد ارزش خبری آشکار")
+        with STATE_LOCK:
+            classifier_stats = state.setdefault("_v53_classifier", classifier_stats)
+            classifier_stats["passed"] = safe_int(classifier_stats.get("passed"), 0) + len(kept)
+            classifier_stats["rejected"] = safe_int(classifier_stats.get("rejected"), 0) + len(rejected)
+            save_state(state)
+        log.info("Cheap classifier %s: kept=%d rejected=%d; صرفه‌جویی قطعی توکن هنوز اندازه‌گیری نشده است", CHEAP_CLASSIFIER_MODEL, len(kept), len(rejected))
+        return kept
+    except Exception as exc:
+        with STATE_LOCK:
+            classifier_stats = state.setdefault("_v53_classifier", classifier_stats)
+            classifier_stats["errors"] = safe_int(classifier_stats.get("errors"), 0) + 1
+            save_state(state)
+        log.warning("پیش‌فیلتر ارزان خطا داد؛ برای جلوگیری از حذف خبر، fail-open: %s", sanitize_error_text(exc))
+        return posts
+
+
+def _auto_rule_group_matches(group, item):
+    if safe_int(item.get("news_score"), 0) < safe_int(group.get("min_score", 0), 0):
+        return False
+    sources = {str(x).lstrip("@").lower() for x in item.get("source_channels", [])}
+    if group.get("source") and str(group.get("source")).lstrip("@").lower() not in sources:
+        return False
+    if group.get("bucket") and normalize_for_match(group.get("bucket")) != normalize_for_match(item.get("content_bucket", "")):
+        return False
+    if group.get("region") and normalize_for_match(group.get("region")) != normalize_for_match(item.get("region", "")):
+        return False
+    return True
+
+
+def apply_auto_approve_rules(state, item):
+    matched = None
+    for rule in state.get("_auto_approve_rules", []):
+        if not isinstance(rule, dict) or not safe_bool(rule.get("enabled", True)):
+            continue
+        groups = rule.get("groups")
+        if isinstance(groups, list) and groups:
+            ok = any(_auto_rule_group_matches(group, item) for group in groups if isinstance(group, dict))
+        else:
+            ok = _auto_rule_group_matches(rule, item)
+        if ok:
+            matched = rule
+            break
+    if matched:
+        item["auto_approved_by_rule"] = matched.get("id")
+        item["auto_approved"] = True
+        item["manual_approval_required"] = False
+    elif safe_bool(state.get("_rules_gate_enabled")):
+        item["manual_approval_required"] = True
+        item["auto_approved"] = False
+    else:
+        item["manual_approval_required"] = False
+        item["auto_approved"] = False
+
+
+def render_auto_rules(state, chat_id, message_id=None):
+    rules = state.get("_auto_approve_rules", [])
+    lines = ["✅ قوانین تأیید خودکار", "", f"حالت بررسی قانون برای همه خبرها: {'روشن (خبرهای بدون تطبیق نیازمند تأیید دستی‌اند)' if state.get('_rules_gate_enabled') else 'خاموش (رفتار قبلی ربات حفظ شده است)'}", ""]
+    rows = []
+    for rule in rules[-15:]:
+        groups = rule.get("groups") if isinstance(rule.get("groups"), list) and rule.get("groups") else [rule]
+        group_descriptions = []
+        for group in groups:
+            desc = f"امتیاز≥{group.get('min_score', '?')}"
+            if group.get("source"): desc += f" | منبع:{group.get('source')}"
+            if group.get("bucket"): desc += f" | سبد:{group.get('bucket')}"
+            if group.get("region"): desc += f" | منطقه:{group.get('region')}"
+            group_descriptions.append(desc)
+        desc = " OR ".join(group_descriptions)
+        lines.append(f"• {'فعال' if rule.get('enabled', True) else 'غیرفعال'} — {desc}")
+        rows.append([admin_button(("🟢 " if rule.get('enabled', True) else "⚪ ") + desc[:38], f"ruletoggle|{rule.get('id')}") , admin_button("حذف", f"ruledelete|{rule.get('id')}")])
+    if not rules: lines.append("هنوز قانونی ثبت نشده است.")
+    rows.extend([[admin_button("➕ افزودن قانون", "ruleadd")], [admin_button("🔁 روشن/خاموش‌کردن گیت قوانین", "rulesgate")], [admin_button("⬅️ V5.3", "v53")]])
+    lines.append("\nدر هر گروه، شرط‌ها با AND ارزیابی می‌شوند؛ گروه‌های جداشده با OR کافی است یکی تطبیق داشته باشد. چند قانون مستقل نیز مثل OR عمل می‌کنند. برای نمونه: score>=85;source=ChannelA OR score>=95;bucket=iran. برای الزام تأیید دستی خبرهای بدون قانون منطبق، گیت قوانین را روشن کن؛ حالت پیش‌فرض برای سازگاری با V5 خاموش است.")
+    admin_render(chat_id, "\n".join(lines), rows, message_id)
+
+
+def render_v53_menu(state, chat_id, message_id=None):
+    paused_until = safe_float(state.get("_paused_until", 0), 0)
+    if paused_until > now_ts():
+        pause_text = datetime.fromtimestamp(paused_until, TEHRAN_TZ or timezone.utc).strftime("%Y-%m-%d %H:%M")
+    elif state.get("_pause_until_important"):
+        pause_text = "تا ورود خبر مهم/فوری"
+    else:
+        pause_text = "فعال؛ بدون توقف زمان‌دار"
+    profile = "حالت جنگ" if state.get("_profile") == "war" else "حالت عادی"
+    rows = [
+        [admin_button("📈 تحلیل عملکرد", "metrics"), admin_button("📡 آمار منابع", "sourcestats")],
+        [admin_button("🔎 جست‌وجوی تاریخچه", "historysearch"), admin_button("📄 خروجی CSV", "exportcsv")],
+        [admin_button("🚫 واژه‌ها و سکوت موضوعی", "terms")],
+        [admin_button("✅ قوانین تأیید خودکار", "rules")],
+        [admin_button("➕ افزودن بلاک‌لیست", "blockadd"), admin_button("⭐ کلیدواژه اولویت", "keyadd")],
+        [admin_button("🔕 سکوت موضوعی موقت", "silenceadd")],
+        [admin_button("⏸ توقف ۱ ساعت", "pause|1h"), admin_button("⏸ تا فردا ۷ صبح", "pause|tomorrow")],
+        [admin_button("⏸ تا خبر مهم", "pause|important"), admin_button("▶️ ادامه", "resume")],
+        [admin_button("⚔️ حالت جنگ", "profile|war"), admin_button("🕊 حالت عادی", "profile|normal")],
+        [admin_button("📥 صف انتشار", "queue"), admin_button("📡 منابع", "sources")],
+        [admin_button("⬅️ منوی اصلی", "menu")],
+    ]
+    admin_render(chat_id, f"🧰 قابلیت‌های Raptor V{BOT_VERSION}\n\nپروفایل: {profile}\nوضعیت توقف: {pause_text}\nبلاک‌لیست: {len(state.get('_blocklist_terms', []))} عبارت\nکلیدواژه‌های اولویت: {len(state.get('_priority_keywords', []))}\nسکوت‌های فعال: {sum(1 for x in state.get('_topic_silences', []) if safe_float(x.get('until_ts'), 0) > now_ts())}\n\nتوجه: پروفایل‌ها فقط تنظیمات انتشار اخبار موجود را تغییر می‌دهند؛ سیستم خبر مستقل باقی می‌ماند.", rows, message_id)
+
+
+def render_terms(state, chat_id, message_id=None):
+    now = now_ts()
+    blocked = state.get("_blocklist_terms", [])[-15:]
+    priority = state.get("_priority_keywords", [])[-15:]
+    silences = [x for x in state.get("_topic_silences", []) if isinstance(x, dict) and safe_float(x.get("until_ts"), 0) > now]
+    lines = ["🚫 قوانین واژگانی و سکوت موضوعی", "", "بلاک‌لیست:"]
+    lines.extend([f"• {x}" for x in blocked] or ["• خالی"])
+    lines.append("\nکلیدواژه‌های اولویت:")
+    lines.extend([f"• {x}" for x in priority] or ["• خالی"])
+    lines.append("\nسکوت‌های فعال:")
+    for entry in silences[-10:]:
+        until = datetime.fromtimestamp(safe_float(entry.get("until_ts"), 0), TEHRAN_TZ or timezone.utc).strftime("%m-%d %H:%M")
+        lines.append(f"• {entry.get('term')} تا {until}")
+    rows = [
+        [admin_button("➕ افزودن عبارت ممنوع", "blockadd")],
+        [admin_button("➕ افزودن کلیدواژه اولویت", "keyadd")],
+        [admin_button("🔕 افزودن سکوت موضوعی", "silenceadd")],
+        [admin_button("⬅️ V5.3", "v53")],
+    ]
+    admin_render(chat_id, "\n".join(lines), rows, message_id)
+
+
+def render_source_stats(state, chat_id, message_id=None):
+    stats = state.get("_source_stats", {})
+    health = state.get("_source_health", {})
+    lines = [f"📡 عملکرد منابع — بروزرسانی {now_tehran().strftime('%Y-%m-%d %H:%M:%S')}", "شمارنده‌ها از داده‌های پردازش‌شده توسط همین ربات هستند؛ برای کانال‌های قدیمی آمار تاریخی کامل محسوب نمی‌شوند.", ""]
+    for source in admin_settings(state).get("source_channels", SOURCE_CHANNELS):
+        source = str(source).lstrip("@")
+        st = stats.get(source, {})
+        h = health.get(source, {})
+        disabled = source in set(state.get("_disabled_sources", []))
+        lines.append(f"@{source} {'[غیرفعال]' if disabled else ''}\n  دریافت‌شده: {safe_int(st.get('fetched'),0)} | جدید: {safe_int(st.get('new'),0)}\n  منتشرشده: {safe_int(st.get('published'),0)} | ردشده: {safe_int(st.get('rejected'),0)} | خطا: {safe_int(st.get('errors'),0)}\n  شکست متوالی: {safe_int(h.get('fail_count'),0)}")
+    admin_render(chat_id, "\n\n".join(lines), [[admin_button("🔄 تازه‌سازی", "sourcestats")], [admin_button("مدیریت منابع", "sources")], [admin_button("V5.3", "v53")]], message_id)
+
+
+def _try_tgstat_views(record):
+    if not TGSTAT_API_TOKEN or not record.get("message_id"):
+        return None
+    target = str(TARGET_CHAT_ID or "").strip().lstrip("@")
+    if not target or target.startswith("-"):
+        return None
+    post_url = f"https://t.me/{target}/{safe_int(record.get('message_id'), 0)}"
+    try:
+        response = requests.get("https://api.tgstat.ru/posts/get", params={"token": TGSTAT_API_TOKEN, "postId": post_url}, timeout=(5, 12))
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("status") == "ok":
+            views = safe_int(payload.get("response", {}).get("views"), -1)
+            if views >= 0:
+                record["views"] = views
+                record["views_checked_ts"] = now_ts()
+                return views
+    except Exception as exc:
+        log.debug("TGStat views lookup failed: %s", sanitize_error_text(exc))
+    return None
+
+
+def render_performance(state, chat_id, message_id=None):
+    history = [x for x in state.get("_published_history", []) if not x.get("deleted")]
+    recent = [x for x in history if safe_float(x.get("ts"), 0) >= now_ts() - 7 * 86400]
+    buckets, providers, sources = {}, {}, {}
+    for rec in history:
+        bucket = rec.get("content_bucket", "world") or "world"
+        buckets[bucket] = buckets.get(bucket, 0) + 1
+        provider = rec.get("ai_provider", "unknown") or "unknown"
+        providers[provider] = providers.get(provider, 0) + 1
+        for src in rec.get("source_channels", []): sources[src] = sources.get(src, 0) + 1
+    views = [safe_int(x.get("views"), -1) for x in history if safe_int(x.get("views"), -1) >= 0]
+    if TGSTAT_API_TOKEN and history:
+        for rec in sorted(history, key=lambda x: safe_float(x.get("ts"), 0), reverse=True)[:5]:
+            if now_ts() - safe_float(rec.get("views_checked_ts"), 0) > 6 * 3600:
+                _try_tgstat_views(rec)
+        views = [safe_int(x.get("views"), -1) for x in history if safe_int(x.get("views"), -1) >= 0]
+        save_state(state)
+    lines = [f"📈 تحلیل عملکرد — آخرین بروزرسانی {now_tehran().strftime('%Y-%m-%d %H:%M:%S')}", "", f"تعداد پست‌های ثبت‌شده در تاریخچه: {len(history)}", f"انتشار ۷ روز اخیر: {len(recent)}", f"پست‌های دارای آمار بازدید: {len(views)}"]
+    if views:
+        lines.append(f"میانگین بازدیدِ رکوردهای بررسی‌شده: {sum(views)//len(views)}")
+    elif not TGSTAT_API_TOKEN:
+        lines.append("بازدید واقعی در دسترس نیست؛ در صورت نیاز، TGSTAT_API_TOKEN را به‌صورت متغیر امن اضافه کن. اعداد بازدید از روی حدس ساخته نمی‌شوند.")
+    lines.append("\nموضوعات/سبدهای پرتکرار:")
+    lines.extend([f"• {k}: {v}" for k, v in sorted(buckets.items(), key=lambda x: x[1], reverse=True)[:8]] or ["• هنوز داده‌ای نیست"])
+    lines.append("\nسهم ارائه‌دهنده در پست‌های منتشرشده:")
+    lines.extend([f"• {k}: {v}" for k, v in sorted(providers.items(), key=lambda x: x[1], reverse=True)[:8]] or ["• هنوز داده‌ای نیست"])
+    lines.append("\nمنابع پرتکرار در تاریخچه:")
+    lines.extend([f"• @{k}: {v}" for k, v in sorted(sources.items(), key=lambda x: x[1], reverse=True)[:8]] or ["• هنوز داده‌ای نیست"])
+    topic_weights = {}
+    have_view_metrics = any(safe_int(rec.get("views"), -1) >= 0 for rec in recent)
+    for rec in recent:
+        weight = max(0, safe_int(rec.get("views"), 0)) if have_view_metrics else 1
+        title_tokens = [t for t in re.findall(r"[\w\u0600-\u06ff]{3,}", normalize_for_match(rec.get("title", "")))
+                        if t not in STOPWORDS and not t.isdigit()]
+        for token in set(title_tokens[:12]):
+            topic_weights[token] = topic_weights.get(token, 0) + weight
+    lines.append("\nموضوعات پرتکرار در تیترهای ۷ روز اخیر:" if not have_view_metrics else "\nموضوعات با بیشترین بازدید تجمیعیِ تیترهای ۷ روز اخیر:")
+    lines.extend([f"• {k}: {v if have_view_metrics else 'تکرار '+str(v)}" for k, v in sorted(topic_weights.items(), key=lambda x: x[1], reverse=True)[:10]] or ["• هنوز داده‌ای نیست"])
+    if not have_view_metrics:
+        lines.append("این فهرست فقط فراوانی واژه‌ها در تیترهاست، نه رتبه‌بندی بر اساس بازدید؛ برای تحلیل بازدید واقعی TGSTAT_API_TOKEN لازم است.")
+    classifier = state.get("_v53_classifier", {})
+    if CHEAP_CLASSIFIER_ENABLED:
+        lines.append(f"\nپیش‌فیلتر ارزان: دیده {safe_int(classifier.get('seen'),0)} | عبور {safe_int(classifier.get('passed'),0)} | رد {safe_int(classifier.get('rejected'),0)} | خطا {safe_int(classifier.get('errors'),0)}")
+        lines.append("صرفه‌جویی ۶۰–۸۰٪ فرض نشده؛ اثر واقعی باید از داده مصرف/کیفیت سنجیده شود.")
+    admin_render(chat_id, "\n".join(lines), [[admin_button("🔄 تازه‌سازی", "metrics")], [admin_button("📄 خروجی CSV", "exportcsv")], [admin_button("V5.3", "v53")]], message_id)
+
+
+def render_history_search_results(state, chat_id, query, matches):
+    rows = []
+    lines = [f"🔎 نتیجه جست‌وجو: {query}", f"یافته‌ها: {len(matches)}", ""]
+    for rec in matches[:12]:
+        lines.append(f"• {rec.get('title','')[:90]} | msg_id={rec.get('message_id','—')} | AI={rec.get('ai_provider','unknown')}")
+        if rec.get("history_id"):
+            rows.append([admin_button(str(rec.get("title", "پست"))[:42], f"h|{rec['history_id']}")])
+    if not matches: lines.append("موردی پیدا نشد.")
+    rows.extend([[admin_button("جست‌وجوی دوباره", "historysearch")], [admin_button("خروجی CSV", "exportcsv")], [admin_button("V5.3", "v53")]])
+    admin_render(chat_id, "\n".join(lines), rows)
+
+
+def render_find_message(state, chat_id, message_id, edit_message_id=None):
+    target = str(message_id).strip()
+    for rec in reversed(state.get("_published_history", [])):
+        ids = {str(rec.get("message_id", ""))}
+        ids.update(str(x) for x in rec.get("message_ids", []) if x)
+        if target in ids:
+            stamp = datetime.fromtimestamp(safe_float(rec.get("ts"), 0), TEHRAN_TZ or timezone.utc).strftime("%Y-%m-%d %H:%M")
+            text = (f"🔍 رکورد پیام {target}\n\nعنوان: {rec.get('title','')}\nزمان: {stamp}\nمنابع: {', '.join(rec.get('source_channels', [])) or 'نامشخص'}\nهوش مصنوعی: {rec.get('ai_provider','unknown')}\nامتیاز: {rec.get('news_score','—')}\nسبد: {rec.get('content_bucket','—')}\n\n{rec.get('body','')}")
+            admin_render(chat_id, text, [[admin_button("بازکردن رکورد", f"h|{rec.get('history_id')}")], [admin_button("تاریخچه", "history")]], edit_message_id)
+            return
+    admin_render(chat_id, f"پیام {target} در تاریخچه موجود پیدا نشد. توجه: فقط پیام‌های ثبت‌شده در state قابل جست‌وجو هستند.", [[admin_button("تاریخچه", "history")], [admin_button("V5.3", "v53")]], edit_message_id)
+
+
+def send_history_csv(state, chat_id):
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(["history_id", "timestamp", "message_id", "message_ids", "title", "body", "news_score", "verification", "ai_provider", "ai_provider_stage1", "ai_provider_editor", "classification_model", "source_channels", "source_urls", "region", "content_bucket", "views", "deleted"])
+    for rec in state.get("_published_history", []):
+        writer.writerow([rec.get("history_id", ""), rec.get("ts", ""), rec.get("message_id", ""), ";".join(str(x) for x in rec.get("message_ids", [])), rec.get("title", ""), rec.get("body", ""), rec.get("news_score", ""), rec.get("verification", ""), rec.get("ai_provider", ""), rec.get("ai_provider_stage1", ""), rec.get("ai_provider_editor", ""), rec.get("classification_model", "disabled"), ";".join(rec.get("source_channels", [])), ";".join(rec.get("source_urls", [])), rec.get("region", ""), rec.get("content_bucket", ""), rec.get("views", ""), rec.get("deleted", False)])
+    data = output.getvalue().encode("utf-8-sig")
+    telegram_request("sendDocument", data={"chat_id": chat_id, "caption": f"تاریخچه Raptor V{BOT_VERSION} — {len(state.get('_published_history', []))} رکورد"}, files={"document": ("raptor_history.csv", data, "text/csv")}, timeout=60)
+
+
+def send_owner_notice(state, alert_key, text, cooldown_seconds=4*3600):
+    if not OWNER_TELEGRAM_ID or not BOT_TOKEN:
+        return False
+    alerts = state.setdefault("_v53_alerts", {})
+    last = safe_float(alerts.get(alert_key), 0)
+    if now_ts() - last < cooldown_seconds:
+        return False
+    try:
+        telegram_request("sendMessage", data={"chat_id": OWNER_TELEGRAM_ID, "text": f"🦅 هشدار Raptor V{BOT_VERSION}\n\n{text}"}, timeout=15)
+        alerts[alert_key] = now_ts()
+        save_state(state)
+        return True
+    except Exception as exc:
+        log.warning("ارسال هشدار به مالک شکست خورد: %s", sanitize_error_text(exc))
+        return False
+
+
+def check_v53_alerts(state):
+    enabled = runtime_provider_order(state)
+    unhealthy = []
+    for provider in enabled:
+        configured = bool(AI_PROVIDER_KEYS.get(provider))
+        ps = provider_state(state, provider)
+        cooling = safe_float(ps.get("cooldown_until"), 0) > now_ts()
+        if not configured or cooling:
+            unhealthy.append(provider)
+    if enabled and len(unhealthy) == len(enabled):
+        send_owner_notice(state, "all_ai_down", "همه ارائه‌دهنده‌های AI فعال فاقد کلید یا در دوره انتظار/خطا هستند. بخش AI را بررسی کن.", 3600)
+    for source, health in state.get("_source_health", {}).items():
+        if safe_int(health.get("fail_count"), 0) >= 3:
+            send_owner_notice(state, f"source:{source}", f"منبع @{source} دست‌کم سه بار متوالی شکست خورده است. آخرین خطا: {health.get('last_error','نامشخص')}", 4*3600)
+    queue_len = len(state.get("_pending_queue", []))
+    if queue_len >= ALERT_QUEUE_HIGH_WATER:
+        send_owner_notice(state, "queue_high", f"صف انتشار به {queue_len} خبر رسیده است (آستانه {ALERT_QUEUE_HIGH_WATER}).", 4*3600)
+    daily_limit = max(0, safe_int(admin_settings(state).get("daily_post_limit", 0), 0))
+    if daily_limit:
+        today_count = published_count_today(state)
+        threshold = max(1, int(daily_limit * 0.8 + 0.999))
+        if today_count >= threshold:
+            send_owner_notice(state, "daily_limit_near", f"امروز {today_count} از سقف {daily_limit} پست منتشر شده است.", 4*3600)
+    runtime = state.get("_runtime", {})
+    last_post = safe_float(runtime.get("last_posted_ts"), 0) or safe_float(runtime.get("started_ts"), now_ts())
+    if not is_quiet_hour(now_tehran(), state) and now_ts() - last_post >= ALERT_NO_POST_HOURS * 3600:
+        send_owner_notice(state, "no_post", f"حدود {int((now_ts()-last_post)/3600)} ساعت است که پستی ثبت نشده؛ منابع، صف، ساعات سکوت، سقف روزانه و وضعیت AI را بررسی کن.", ALERT_NO_POST_HOURS*3600)
+
+
+def maybe_send_weekly_summary(state):
+    now = now_tehran()
+    if now.isoweekday() != 7 or now.hour < 20:
+        return
+    week_key = f"{now.isocalendar().year}-W{now.isocalendar().week:02d}"
+    if state.get("_weekly_summary_last_week") == week_key:
+        return
+    cutoff = now_ts() - 7*86400
+    recent = [x for x in state.get("_published_history", []) if safe_float(x.get("ts"), 0) >= cutoff and not x.get("deleted")]
+    bucket_counts, ai_counts = {}, {}
+    for rec in recent:
+        bucket = rec.get("content_bucket", "world") or "world"
+        bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+        provider = rec.get("ai_provider", "unknown") or "unknown"
+        ai_counts[provider] = ai_counts.get(provider, 0) + 1
+    lines = [f"📊 خلاصه هفتگی رپتور ({week_key})", f"پست‌های ثبت‌شده: {len(recent)}", f"اندازه فعلی صف: {len(state.get('_pending_queue', []))}", "سبدهای پرتکرار:"]
+    lines.extend([f"• {k}: {v}" for k, v in sorted(bucket_counts.items(), key=lambda x: x[1], reverse=True)[:5]] or ["• داده‌ای موجود نیست"])
+    lines.append("ارائه‌دهنده‌های ثبت‌شده:")
+    lines.extend([f"• {k}: {v}" for k, v in sorted(ai_counts.items(), key=lambda x: x[1], reverse=True)[:5]] or ["• داده‌ای موجود نیست"])
+    if send_owner_notice(state, "weekly:" + week_key, "\n".join(lines), 1):
+        state["_weekly_summary_last_week"] = week_key
+        save_state(state)
 
 
 # ============================================================
@@ -5557,6 +6257,12 @@ def main():
 
     state = load_state()
     initialize_ai_state(state)
+    # اگر فرایند وسط ارسال متوقف شده باشد، نتیجه را نامشخص می‌کنیم تا ارسال تکراری خودکار رخ ندهد.
+    for queued in state.get("_pending_queue", []):
+        if queued.get("delivery_status") == "sending":
+            queued["delivery_status"] = "uncertain"
+            queued["delivery_uncertain_ts"] = now_ts()
+            queued["delivery_error"] = "فرایند هنگام انتشار متوقف شد؛ نتیجه ارسال مشخص نیست و بررسی مدیر لازم است."
     state.setdefault("_runtime", {})["started_ts"] = now_ts()
     state.setdefault("_runtime", {})["last_cycle_error"] = ""
     purge_recent_memories(state)
@@ -5564,7 +6270,7 @@ def main():
     save_state(state)
 
     log.info("==============================================")
-    log.info("Raptor News Bot v5 شروع شد")
+    log.info("Raptor News Bot v%s شروع شد", BOT_VERSION)
     log.info("Telegram sources: %s", len(runtime_source_channels(state)))
     log.info(
         "AI pipeline: %s | keys: Groq=%s Gemini=%s Mistral=%s",
@@ -5598,9 +6304,10 @@ def main():
         try:
             process_once(state)
         except Exception as exc:
-            state.setdefault("_runtime", {})["last_cycle_error"] = sanitize_error_text(exc)
-            record_system_error(state, "Main", "چرخه اصلی", exc)
-            save_state(state)
+            with STATE_LOCK:
+                state.setdefault("_runtime", {})["last_cycle_error"] = sanitize_error_text(exc)
+                record_system_error(state, "Main", "چرخه اصلی", exc)
+                save_state(state)
             log.exception("خطای عمومی در چرخه اصلی: %s", sanitize_error_text(exc))
         elapsed = now_ts() - started
         sleep_for = max(5, POLL_INTERVAL_SECONDS - int(elapsed))
