@@ -1,4 +1,4 @@
-"""Raptor V5.6 independent analytical-content subsystem.
+"""Raptor V5.7 independent analytical-content subsystem.
 
 All analytics records live under state['_analytics']; news queue/configuration is read-only.
 Gemini is the default and exclusive provider for analytical research and content operations.
@@ -26,10 +26,14 @@ MIN_POSTS = 5
 MAX_POSTS = 6
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 DEFAULT_TZ = "Asia/Tehran"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 class AnalyticsError(RuntimeError):
     """Expected user-facing analytics error."""
+
+
+class AIUnavailableError(AnalyticsError):
+    """Provider credentials or service are temporarily unavailable; task is retryable."""
 
 
 def now_ts() -> float:
@@ -44,6 +48,9 @@ def _default_settings() -> dict:
         "require_image": True, "target_chat_id": os.getenv("ANALYTICS_TARGET_CHAT_ID", os.getenv("TARGET_CHAT_ID", "")).strip(),
         "auto_reschedule": True, "daily_project_limit": 1,
         "default_post_count": 6, "default_tone": "تحلیلی، طبیعی و گفت‌وگومحور",
+        # Opt-in switches preserve the previous default behavior until the owner enables them.
+        "auto_failover": False,
+        "queue_when_ai_unavailable": False,
         "updated_at": now_ts(),
     }
 
@@ -61,6 +68,9 @@ def ensure_state(state: dict) -> dict:
         a["settings"].setdefault(key, value)
     a.setdefault("history", [])
     a.setdefault("runtime_errors", [])
+    a.setdefault("ai_queue", [])
+    if not isinstance(a["ai_queue"], list):
+        a["ai_queue"] = []
     a.setdefault("created_at", now_ts())
     a["schema_version"] = SCHEMA_VERSION
     # Defensive migration: old or manually edited records should not break the UI loop.
@@ -148,7 +158,7 @@ def _redact(value, keys=()) -> str:
 def gemini_call(prompt: str, *, model=None, use_search=False, timeout=90):
     keys = [x.strip() for x in os.getenv("GEMINI_API_KEYS", "").split(",") if x.strip()]
     if not keys:
-        raise AnalyticsError("GEMINI_API_KEYS تنظیم نشده است؛ عملیات هوش مصنوعی متوقف شد.")
+        raise AIUnavailableError("GEMINI_API_KEYS تنظیم نشده است؛ عملیات هوش مصنوعی قابل اجرا نیست.")
     # Keep analytics model configuration independent from the news subsystem's GEMINI_MODEL.
     model = model or os.getenv("ANALYTICS_GEMINI_MODEL", "gemini-3.8-flash")
     model = re.sub(r"[^A-Za-z0-9._-]", "", model)
@@ -158,11 +168,15 @@ def gemini_call(prompt: str, *, model=None, use_search=False, timeout=90):
     if use_search:
         body["tools"] = [{"google_search": {}}]
     errors = []
+    retryable_failure = False
     for key in keys:
         try:
             r = requests.post(url, params={"key": key}, json=body, timeout=timeout)
             if r.status_code >= 400:
-                errors.append(f"HTTP {r.status_code}: {_redact(r.text[:250], keys)}")
+                detail = f"HTTP {r.status_code}: {_redact(r.text[:250], keys)}"
+                errors.append(detail)
+                if r.status_code in {408, 409, 425, 429, 500, 502, 503, 504}:
+                    retryable_failure = True
                 continue
             payload = r.json()
             result = _extract_text(payload)
@@ -170,10 +184,15 @@ def gemini_call(prompt: str, *, model=None, use_search=False, timeout=90):
                 errors.append("پاسخ Gemini فاقد متن بود.")
                 continue
             return result, payload
+        except requests.RequestException as exc:
+            retryable_failure = True
+            errors.append(f"{type(exc).__name__}: {_redact(exc, keys)}")
         except Exception as exc:
             errors.append(f"{type(exc).__name__}: {_redact(exc, keys)}")
-    # No automatic Groq/Mistral failover: user must explicitly initiate an alternative workflow.
-    raise AnalyticsError("Gemini در تمام کلیدهای تنظیم‌شده ناموفق بود. عملیات متوقف شد و مقاله ناقص تأیید/منتشر نشد. " + " | ".join(errors[-3:]))
+    message = "Gemini در تمام کلیدهای تنظیم‌شده ناموفق بود؛ مقاله ناقص تأیید/منتشر نشد. " + " | ".join(errors[-3:])
+    if retryable_failure or not errors:
+        raise AIUnavailableError(message)
+    raise AnalyticsError(message)
 
 
 def _openai_compatible_call(provider: str, prompt: str, timeout=90):
@@ -190,8 +209,9 @@ def _openai_compatible_call(provider: str, prompt: str, timeout=90):
     else:
         raise AnalyticsError("ارائه‌دهنده جایگزین پشتیبانی نمی‌شود.")
     if not keys:
-        raise AnalyticsError(f"کلید API برای {provider} تنظیم نشده است؛ پروژه تغییری نکرد.")
+        raise AIUnavailableError(f"کلید API برای {provider} تنظیم نشده است؛ عملیات قابل اجرا نیست.")
     errors = []
+    retryable_failure = False
     for key in keys:
         try:
             r = requests.post(url, headers={"Authorization": f"Bearer {key}"}, json={
@@ -202,6 +222,8 @@ def _openai_compatible_call(provider: str, prompt: str, timeout=90):
             }, timeout=timeout)
             if r.status_code >= 400:
                 errors.append(f"HTTP {r.status_code}: {_redact(r.text[:200], keys)}")
+                if r.status_code in {408, 409, 425, 429, 500, 502, 503, 504}:
+                    retryable_failure = True
                 continue
             obj = r.json()
             content = obj.get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -210,19 +232,91 @@ def _openai_compatible_call(provider: str, prompt: str, timeout=90):
             if content and str(content).strip():
                 return str(content).strip(), obj
             errors.append("پاسخ فاقد متن بود.")
+        except requests.RequestException as exc:
+            retryable_failure = True
+            errors.append(f"{type(exc).__name__}: {_redact(exc, keys)}")
         except Exception as exc:
             errors.append(f"{type(exc).__name__}: {_redact(exc, keys)}")
-    raise AnalyticsError(f"ارائه‌دهنده جایگزین {provider} ناموفق بود: {' | '.join(errors[-2:])}")
+    message = f"ارائه‌دهنده {provider} ناموفق بود: {' | '.join(errors[-2:])}"
+    if retryable_failure or not errors:
+        raise AIUnavailableError(message)
+    raise AnalyticsError(message)
 
 
 def project_ai_call(project: dict, prompt: str, *, use_search=False, timeout=90):
-    """Gemini by default; alternate provider is used only after an explicit admin selection."""
-    provider = str(project.get("ai_provider_override") or "gemini").lower()
-    if provider == "gemini":
-        return gemini_call(prompt, use_search=use_search, timeout=timeout)
-    if use_search:
-        prompt += "\nتوجه: این درخواست با ارائه‌دهنده جایگزین انجام می‌شود؛ منابع واقعی پیوست‌شده را مبنا قرار بده."
-    return _openai_compatible_call(provider, prompt, timeout=timeout)
+    """Use the selected provider, optionally falling through the active provider order."""
+    primary = str(project.get("ai_provider_override") or "gemini").lower()
+    runtime = project.get("_ai_runtime") if isinstance(project.get("_ai_runtime"), dict) else {}
+    auto_failover = bool(runtime.get("auto_failover", False))
+    enabled = runtime.get("enabled_providers", [])
+    order = runtime.get("provider_order", [])
+
+    valid_providers = {"gemini", "groq", "mistral"}
+    enabled_set = {str(x).lower() for x in enabled if str(x).lower() in valid_providers}
+    enforce_enabled = bool(runtime.get("enforce_enabled", False))
+    manual_override = bool(runtime.get("manual_provider_override", False))
+    if auto_failover:
+        candidates = [primary] + [str(x).lower() for x in order]
+        candidates = list(dict.fromkeys(x for x in candidates if x in valid_providers))
+        if enforce_enabled:
+            candidates = [x for x in candidates if x in enabled_set]
+    else:
+        candidates = [primary] if primary in valid_providers else ["gemini"]
+        if enforce_enabled and not manual_override and primary not in enabled_set:
+            candidates = []
+
+    errors = []
+    for provider in candidates:
+        try:
+            if provider == "gemini":
+                result = gemini_call(prompt, use_search=use_search, timeout=timeout)
+            else:
+                alternate_prompt = prompt
+                if use_search:
+                    alternate_prompt += "\nتوجه: این مرحله با ارائه‌دهنده جایگزین انجام می‌شود؛ نتایج واقعی جست‌وجوی پیوست‌شده را مبنا قرار بده؛ Google Search grounding در این مرحله فعال نیست."
+                result = _openai_compatible_call(provider, alternate_prompt, timeout=timeout)
+            project["last_ai_provider"] = provider
+            return result
+        except AnalyticsError as exc:
+            errors.append(f"{provider}: {str(exc)[:260]}")
+            if not auto_failover:
+                raise
+            continue
+
+    if not candidates:
+        raise AIUnavailableError("هیچ ارائه‌دهنده فعال و مجازی برای این پروژه تحلیلی در دسترس نیست؛ پروژه می‌تواند در صف انتظار بماند.")
+    message = "تمام ارائه‌دهندگان فعال محتوای تحلیلی ناموفق بودند: " + " | ".join(errors[-3:])
+    if any("HTTP 4" in x for x in errors) and not any("HTTP 429" in x or "HTTP 5" in x for x in errors):
+        raise AnalyticsError(message)
+    raise AIUnavailableError(message)
+
+
+def enqueue_ai_task(state: dict, project_id: str, operation: str, *, args=None, owner_id=None, error="") -> dict:
+    """Persist a retryable analytical AI task without altering news queues."""
+    a = ensure_state(state)
+    valid_operations = {"research", "split"}
+    if operation not in valid_operations:
+        raise AnalyticsError("نوع کار صف هوش مصنوعی تحلیلی پشتیبانی نمی‌شود.")
+    project = a["projects"].get(str(project_id))
+    if not project:
+        raise AnalyticsError("پروژه برای ورود به صف هوش مصنوعی پیدا نشد.")
+    for existing in a["ai_queue"]:
+        if (isinstance(existing, dict) and existing.get("project_id") == str(project_id)
+                and existing.get("operation") == operation and existing.get("status") in {"queued", "processing"}):
+            return existing
+    task = {
+        "id": uuid.uuid4().hex[:12], "project_id": str(project_id), "operation": operation,
+        "args": copy.deepcopy(args or {}), "owner_id": int(owner_id) if owner_id is not None else None,
+        "status": "queued", "attempts": 0, "created_at": now_ts(), "updated_at": now_ts(),
+        "next_attempt_at": now_ts(), "last_error": str(error or "")[:500],
+    }
+    a["ai_queue"].append(task)
+    a["ai_queue"] = a["ai_queue"][-300:]
+    project["status"] = "queued_ai"
+    project["queue_task_id"] = task["id"]
+    project["last_error"] = str(error or "در صف انتظار برای فعال‌شدن هوش مصنوعی")[:500]
+    _append_history(project, "ai_task_queued", f"operation={operation}; task={task['id']}", owner_id)
+    return task
 
 
 def web_search(query: str, limit=8):
@@ -320,8 +414,8 @@ def research_project(project: dict):
     project["research_grounding"] = {
         "search_results": len(sources), "duckduckgo_results": len(results),
         "gemini_grounding_metadata": bool(grounding), "completed_at": now_ts(),
-        "provider": project.get("ai_provider_override") or "gemini",
-        "method": "DuckDuckGo HTML + Gemini Google Search grounding attempted" if (project.get("ai_provider_override") or "gemini") == "gemini" else "DuckDuckGo HTML + manually selected alternate provider",
+        "provider": project.get("last_ai_provider") or project.get("ai_provider_override") or "gemini",
+        "method": "DuckDuckGo HTML + Gemini Google Search grounding attempted" if project.get("last_ai_provider", project.get("ai_provider_override") or "gemini") == "gemini" else "DuckDuckGo HTML + alternate provider using attached search evidence",
     }
     project["status"] = "review_research"
     project["last_error"] = ""

@@ -11,6 +11,7 @@ import threading
 import csv
 import io
 import copy
+import uuid
 import analytics as analytics_v55
 from datetime import datetime, timezone, timedelta
 
@@ -186,7 +187,7 @@ AI_RECENT_INPUT_WINDOW_MINUTES = max(
     24 * 60, env_int("AI_RECENT_INPUT_WINDOW_MINUTES", 24 * 60)
 )
 AI_LOCAL_DUP_THRESHOLD = min(
-    0.97, max(0.90, env_float("AI_LOCAL_DUP_THRESHOLD", 0.94))
+    0.999, max(0.97, env_float("AI_LOCAL_DUP_THRESHOLD", 0.985))
 )
 
 # امتیاز ارزش خبری: خبرهای زیر 50 اصلاً وارد صف نمی‌شوند.
@@ -211,8 +212,8 @@ DEDUP_WINDOW_MINUTES = max(
     24 * 60, env_int("DEDUP_WINDOW_MINUTES", 24 * 60)
 )
 DEDUP_SIMILARITY_THRESHOLD = min(
-    0.96,
-    max(0.78, env_float("DEDUP_SIMILARITY_THRESHOLD", 0.82)),
+    0.98,
+    max(0.78, env_float("DEDUP_SIMILARITY_THRESHOLD", 0.88)),
 )
 EVENT_MEMORY_WINDOW_MINUTES = max(
     48 * 60, env_int("EVENT_MEMORY_WINDOW_MINUTES", 72 * 60)
@@ -224,7 +225,7 @@ EVENT_MAX_UPDATES_PER_24H = max(
     1, min(4, env_int("EVENT_MAX_UPDATES_PER_24H", 2))
 )
 EVENT_SIMILARITY_THRESHOLD = min(
-    0.95, max(0.50, env_float("EVENT_SIMILARITY_THRESHOLD", 0.62))
+    0.98, max(0.50, env_float("EVENT_SIMILARITY_THRESHOLD", 0.72))
 )
 
 # ============================================================
@@ -275,7 +276,7 @@ except ValueError:
 STATE_IO_LOCK = threading.RLock()
 # قفل مشترک برای تراکنش‌های منطقی state؛ قفل نوشتن فایل به‌تنهایی کافی نیست.
 STATE_LOCK = threading.RLock()
-BOT_VERSION = "5.6"
+BOT_VERSION = "5.7"
 CHEAP_CLASSIFIER_ENABLED = os.environ.get("CHEAP_CLASSIFIER_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 CHEAP_CLASSIFIER_MODEL = os.environ.get("CHEAP_CLASSIFIER_MODEL", "openai/gpt-oss-20b").strip()
 TGSTAT_API_TOKEN = os.environ.get("TGSTAT_API_TOKEN", "").strip()
@@ -288,7 +289,7 @@ MAX_ADMIN_LOGS = 100
 
 HTTP_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (compatible; RaptorNewsBot/5.3; "
+        "Mozilla/5.0 (compatible; RaptorNewsBot/5.7; "
         "+https://t.me/khaatshekaan)"
     )
 }
@@ -319,9 +320,18 @@ NIGHT_MESSAGE = (
 # ============================================================
 
 IRAN_TERMS = {
-    "iran", "ایران", "تهران", "tehran", "isfahan", "اصفهان", "تبریز",
-    "tbriz", "shiraz", "شیراز", "سپاه", "ارتش", "نیروی قدس", "iranian",
-    "iranian forces", "persian gulf", "خلیج فارس",
+    "iran", "iranian", "iran's", "iranian forces", "iran-backed", "iran-linked",
+    "islamic republic", "irgc", "irgc navy", "irgc aerospace", "qods force",
+    "tehran", "isfahan", "tabriz", "shiraz", "persian gulf", "strait of hormuz",
+    "hormuz", "ایران", "ایرانی", "ایرانی‌ها", "جمهوری اسلامی", "تهران",
+    "اصفهان", "تبریز", "شیراز", "سپاه", "سپاه پاسداران", "نیروی قدس",
+    "نیروی هوافضای سپاه", "نیروی دریایی سپاه", "ارتش ایران", "خلیج فارس",
+    "تنگه هرمز", "تحریم ایران", "صنایع دفاعی ایران", "هسته‌ای ایران",
+    "iran nuclear", "iran nuclear deal", "iran sanctions", "iranian military",
+    "iranian navy", "iranian air force", "iranian army", "iranian defense",
+    "iranian defence", "iranian drone", "iranian missile", "islamic revolutionary guard",
+    "revolutionary guard corps", "سپاه پاسداران انقلاب اسلامی", "نیروی هوایی ارتش",
+    "پدافند هوایی ایران", "صنایع هوافضای ایران", "نفت ایران", "iranian oil",
 }
 
 MIDDLE_EAST_TERMS = {
@@ -365,15 +375,16 @@ WORLD_VARIETY_TERMS = {
 }
 
 
-# سبد محتوایی نسخه 3.5:
-# ایران 40% | جنگ/درگیری خاورمیانه 20% | تحولات خاورمیانه 10%
-# روسیه-اوکراین 10% | نظامی/تسلیحاتی آمریکا-روسیه-چین 20%
+# سبد متعادل‌تر: سهم ایران افزایش یافته، خبرهای صرفاً تسلیحاتی ابرقدرت‌ها کاهش یافته
+# و برای خبرهای مهم جهانی خارج از این سبدها نیز مسیر مستقل حفظ شده است.
 CONTENT_BUCKET_TARGETS = {
-    "iran": 0.40,
-    "middle_east_war": 0.20,
-    "middle_east_developments": 0.10,
-    "russia_ukraine": 0.10,
-    "superpower_military": 0.20,
+    "iran": 0.45,
+    "middle_east_war": 0.16,
+    "middle_east_developments": 0.09,
+    "russia_ukraine": 0.09,
+    "superpower_military": 0.10,
+    "international_weapons": 0.06,
+    "world": 0.05,
 }
 CONTENT_BUCKET_WINDOW = 20
 ALLOWED_CONTENT_BUCKETS = set(CONTENT_BUCKET_TARGETS)
@@ -775,7 +786,7 @@ def event_key_or_signature(title, body, event_key=""):
 
 def default_state():
     return {
-        "version": 5.3,
+        "version": 5.7,
         "_source_initialized": {},
         "_recent_titles": [],
         "_recent_events": [],
@@ -830,6 +841,7 @@ def default_state():
         "_admin_sessions": {},
         "_admin_activity": [],
         "_recent_decisions": [],
+        "_rejected_news": [],
         "_system_errors": [],
         "_published_history": [],
         "_runtime": {
@@ -944,10 +956,12 @@ def load_state():
         for key, value in v53.items():
             if key not in base or not isinstance(base.get(key), type(value)):
                 base[key] = copy.deepcopy(value)
+        if not isinstance(base.get("_rejected_news"), list):
+            base["_rejected_news"] = []
         for channel in settings.get("source_channels", SOURCE_CHANNELS):
             base["_source_stats"].setdefault(str(channel), {"fetched": 0, "new": 0, "published": 0, "rejected": 0, "errors": 0})
             base["_source_health"].setdefault(str(channel), {"fail_count": 0, "last_ok_ts": 0, "last_error_ts": 0, "last_error": ""})
-        base["version"] = 5.5
+        base["version"] = 5.7
         return base
     except Exception as exc:
         # Never overwrite a corrupt state file with a fresh empty state: preserve evidence and stop startup.
@@ -1188,6 +1202,16 @@ def infer_content_bucket(text, region=""):
         "تانک", "tank", "پهپاد", "drone", "موشک", "missile",
         "پدافند", "air defense", "navy", "ارتش"
     }
+    acquisition_terms = {
+        "خرید", "سفارش", "قرارداد", "تحویل", "دریافت جنگنده", "رونمایی",
+        "توسعه سامانه", "توسعه جنگنده", "نسخه جدید", "سامانه جدید",
+        "procurement", "purchase", "ordered", "order for", "contract",
+        "delivery", "delivered", "unveiled", "introduced", "new variant",
+        "new system", "development program", "arms deal", "arms package",
+    }
+    if contains_any(text, military_terms) and contains_any(text, acquisition_terms):
+        return "international_weapons"
+
     if contains_any(text, SUPERPOWER_ALLOWED_TERMS) and contains_any(text, military_terms):
         return "superpower_military"
 
@@ -1218,13 +1242,17 @@ def calculate_priority(item):
 
     bucket = item.get("content_bucket") or infer_content_bucket(text, region)
     if bucket in {"middle_east_war", "russia_ukraine"}:
-        score += 70
+        score += 68
     elif bucket == "iran":
-        score += 45
+        score += 62
     elif bucket == "middle_east_developments":
         score += 30
     elif bucket == "superpower_military":
-        score += 22
+        score += 8
+    elif bucket == "international_weapons":
+        score -= 8
+    elif bucket == "world":
+        score += 8
     else:
         score -= 100
 
@@ -1238,7 +1266,7 @@ def calculate_priority(item):
         score += 20
 
     if region == "iran":
-        score += 35
+        score += 48
     elif region == "middle_east":
         score += 25
     elif region == "superpower":
@@ -1277,9 +1305,13 @@ def calculate_priority(item):
     except Exception:
         pass
 
-    # خبر جهانی صفر نمی‌شود؛ فقط نسبت به اولویت منطقه‌ای کمی عقب‌تر است.
+    # خبر جهانی حفظ می‌شود؛ صرفاً خبرهای تسلیحاتی ابرقدرت‌ها وزن کمتری می‌گیرند.
+    if bucket == "superpower_military":
+        score -= 15
+    elif bucket == "international_weapons":
+        score -= 18
     if region == "world" and not is_military_event(text, event_type):
-        score -= 3
+        score -= 1
 
     return score, region
 
@@ -1390,6 +1422,12 @@ def choose_available_provider_keys(state, provider):
         if float(entry.get("cooldown_until", 0) or 0) <= now:
             available.append((idx, key))
     if available:
+        # Balance load across keys instead of repeatedly exhausting the first key.
+        available.sort(key=lambda pair: (
+            safe_float(info[key_id(pair[1])].get("last_used"), 0),
+            safe_int(info[key_id(pair[1])].get("fail_count"), 0),
+            pair[0],
+        ))
         return available
 
     # اگر همه کلیدهای همان provider cooldown هستند، provider را هم bypass می‌کنیم؛
@@ -1694,11 +1732,10 @@ def call_single_provider(state, provider, prompt, task_name):
                 mark_provider_success(state, provider, key)
                 save_state(state)
                 log.info(
-                    "%s موفق | task=%s | model=%s | key=%s",
+                    "%s موفق | task=%s | model=%s",
                     AI_PROVIDER_LABELS[provider],
                     task_name,
                     provider_model_name(provider),
-                    key_id(key),
                 )
                 return parsed
 
@@ -1708,19 +1745,29 @@ def call_single_provider(state, provider, prompt, task_name):
             )
 
             if status == 429:
-                retry_after = min(
+                pstate = provider_state(state, provider)
+                repeated = safe_int(pstate.get("fail_count"), 0) + 1
+                adaptive = AI_PROVIDER_COOLDOWN_FLOOR_SECONDS * (2 ** min(8, repeated - 1))
+                cooldown = min(
                     AI_429_MAX_COOLDOWN_SECONDS,
-                    max(AI_PROVIDER_COOLDOWN_FLOOR_SECONDS, retry_after),
+                    max(AI_PROVIDER_COOLDOWN_FLOOR_SECONDS, retry_after, adaptive),
                 )
-                mark_provider_cooldown(state, provider, retry_after, status)
-                mark_key_cooldown(state, provider, key, retry_after, status)
+                mark_key_cooldown(state, provider, key, cooldown, status)
+                key_states = provider_key_states(state, provider)
+                all_cooling = all(
+                    safe_float(key_states.get(key_id(configured_key), {}).get("cooldown_until"), 0) > now_ts()
+                    for configured_key in AI_PROVIDER_KEYS.get(provider, [])
+                )
+                if all_cooling:
+                    mark_provider_cooldown(state, provider, cooldown, status)
                 save_state(state)
-                raise AIProviderError(
-                    provider,
-                    status,
-                    f"429؛ cooldown {retry_after}s",
-                    retry_after=retry_after,
+                last_error = AIProviderError(
+                    provider, status, f"429؛ کلید فعلی cooldown {cooldown}s",
+                    retry_after=cooldown,
                 )
+                if attempt + 1 < attempts:
+                    continue
+                raise last_error
 
             if status in (401, 403):
                 mark_key_cooldown(state, provider, key, 6 * 3600, status)
@@ -1967,6 +2014,10 @@ def validate_ai_items(items, max_items=EVENT_MAX_OUTPUT_ITEMS, state=None):
             reason = f"امتیاز ارزش خبری {news_score} کمتر از حداقل {MIN_NEWS_SCORE} بود؛ رد نهایی تحریریه‌ای، نه خطای فنی"
             if state is not None:
                 record_decision(state, title, "رد‌شده", reason, news_score)
+                record_rejected_news(state, {"title": title, "body": body, "news_score": news_score,
+                    "region": raw.get("region", "world"), "content_bucket": raw.get("content_bucket", "world"),
+                    "event_key": raw.get("event_key", ""), "source_channels": raw.get("source_channels", []),
+                    "source_urls": raw.get("source_urls", [])}, reason, news_score)
             validated.append({
                 "draft_id": safe_int(raw.get("draft_id"), 0), "relevant": False,
                 "duplicate": False, "duplicate_reason": reason, "rejection_reason": "low_news_score",
@@ -2740,7 +2791,7 @@ def send_video_to_telegram(title, body, video_url):
                 pass
 
 
-def strip_source_channel_attribution(text):
+def strip_source_channel_attribution(text, source_channels=None, source_name=None):
     """
     نام/یوزرنیم کانال‌های منبع نباید وارد پست عمومی شوند.
     این پاک‌سازی فقط attribution به کانال‌های منبع را هدف می‌گیرد و
@@ -2761,20 +2812,24 @@ def strip_source_channel_attribution(text):
     for pattern in patterns:
         text = re.sub(pattern, "", text)
 
-    # نام‌های منبع فعلی ربات را نیز اگر به شکل plain text داخل attribution آمده باشند، حذف کن.
-    for channel in SOURCE_CHANNELS:
-        if not channel:
-            continue
+    # Remove every configured source handle/name even if the model omits the word "channel".
+    # Only exact token boundaries are removed, so ordinary words are not damaged.
+    source_names = set(SOURCE_CHANNELS)
+    source_names.update(x.strip().lstrip("@") for x in split_csv(os.environ.get("SOURCE_CHANNELS", "")))
+    if isinstance(source_channels, (list, tuple, set)):
+        source_names.update(str(x).strip().lstrip("@") for x in source_channels if str(x).strip())
+    if isinstance(source_name, str):
+        source_names.update(x.strip().lstrip("@") for x in re.split(r"[,،;|]", source_name) if x.strip())
+    for channel in sorted((x for x in source_names if x), key=len, reverse=True):
+        escaped = re.escape(channel)
+        text = re.sub(rf"(?i)(?<![A-Za-z0-9_])@?{escaped}(?![A-Za-z0-9_])", "", text)
         text = re.sub(
-            rf"(?i)(?<![A-Za-z0-9_])(?:کانال|چنل)\s+@?{re.escape(channel)}\b",
+            rf"(?i)(?<![A-Za-z0-9_])(?:کانال|چنل|منبع)\s+@?{escaped}(?![A-Za-z0-9_])",
             "",
             text,
         )
-        text = re.sub(
-            rf"(?i)(?<![A-Za-z0-9_])@{re.escape(channel)}\b",
-            "",
-            text,
-        )
+    # Strip residual generic Telegram usernames from the public copy, not from admin metadata.
+    text = re.sub(r"(?<![A-Za-z0-9_])@[A-Za-z0-9_]{5,32}(?![A-Za-z0-9_])", "", text)
 
     # فاصله/نشانه‌گذاری باقی‌مانده از حذف attribution را مرتب کن.
     text = re.sub(r"[ \t]+", " ", text)
@@ -2786,13 +2841,19 @@ def strip_source_channel_attribution(text):
 
 def format_public_title(item):
     return normalize_persian_text(
-        strip_source_channel_attribution(item.get("title", ""))
+        strip_source_channel_attribution(
+            item.get("title", ""), item.get("source_channels", []),
+            item.get("source_name") or item.get("source_channel", ""),
+        )
     )
 
 
 def format_public_body(item):
     """خروجی عمومی فقط خبر است؛ هیچ تحلیل/📌 یا عبارت قالبیِ تأیید به‌صورت خودکار تزریق نمی‌شود."""
-    body = strip_source_channel_attribution(item.get("body", ""))
+    body = strip_source_channel_attribution(
+        item.get("body", ""), item.get("source_channels", []),
+        item.get("source_name") or item.get("source_channel", ""),
+    )
     return normalize_persian_text(body)
 
 
@@ -2945,12 +3006,14 @@ def _is_input_duplicate_unlocked(state, post):
         if not old_text:
             continue
         sim = combined_similarity(text, "", old_text, "")
-        if sim >= AI_LOCAL_DUP_THRESHOLD:
+        local_threshold = 0.995 if state.get("_profile") == "war" else AI_LOCAL_DUP_THRESHOLD
+        if sim >= local_threshold:
             return True
         old_tokens = set(recent.get("tokens", []))
         if current_tokens and old_tokens:
             overlap = len(current_tokens & old_tokens) / max(1, len(current_tokens | old_tokens))
-            if overlap >= 0.75 and min(len(current_tokens), len(old_tokens)) >= 6:
+            overlap_threshold = 0.985 if state.get("_profile") == "war" else 0.97
+            if overlap >= overlap_threshold and min(len(current_tokens), len(old_tokens)) >= 10:
                 return True
     return False
 
@@ -2991,7 +3054,9 @@ def entity_overlap_count(a, b):
     return len(ea & eb)
 
 
-def update_limit_reached(existing):
+def update_limit_reached(existing, state=None):
+    if state is not None and state.get("_profile") == "war":
+        return False
     last_ts = float(existing.get("last_published_ts", 0) or 0)
     updates = int(existing.get("updates_24h", 0) or 0)
     if not last_ts:
@@ -2999,6 +3064,19 @@ def update_limit_reached(existing):
     if now_ts() - last_ts > 24 * 3600:
         return False
     return updates >= EVENT_MAX_UPDATES_PER_24H
+
+
+def dedup_thresholds(state):
+    """Higher similarity thresholds reduce false-positive duplicate rejection."""
+    normal_full = max(0.88, DEDUP_SIMILARITY_THRESHOLD)
+    normal_signature = max(0.72, EVENT_SIMILARITY_THRESHOLD)
+    if state.get("_profile") == "war":
+        return max(0.96, normal_full), max(0.88, normal_signature), 4, 0.80
+    return normal_full, normal_signature, 3, 0.72
+
+
+def update_novelty_threshold(state):
+    return 35 if state.get("_profile") == "war" else 50
 
 
 def compare_event_relation(state, item, existing_items):
@@ -3018,13 +3096,15 @@ def compare_event_relation(state, item, existing_items):
     event_type = item.get("event_type", "")
     entities = item.get("entities", [])
     incoming_uids = {str(x) for x in item.get("source_uids", []) if str(x).strip()}
+    full_threshold, signature_threshold, entity_threshold, title_anchor = dedup_thresholds(state)
+    novelty_threshold = update_novelty_threshold(state)
 
     for existing in existing_items:
         old_uids = {str(x) for x in existing.get("source_uids", []) if str(x).strip()}
         if incoming_uids and old_uids and incoming_uids & old_uids:
-            if update_limit_reached(existing):
+            if update_limit_reached(existing, state):
                 return "duplicate"
-            if is_update and novelty >= EVENT_UPDATE_MIN_NOVELTY:
+            if is_update and novelty >= novelty_threshold:
                 return "update"
             return "duplicate"
         old_title = existing.get("title", "")
@@ -3043,15 +3123,17 @@ def compare_event_relation(state, item, existing_items):
         same_event_type = bool(event_type and old_event_type and event_type == old_event_type)
 
         related = False
-        if exact_key:
+        if exact_key and state.get("_profile") == "war":
+            # در حالت جنگ، event_key به‌تنهایی کافی نیست؛ شباهت واقعی هم لازم است.
+            related = full_sim >= 0.96 or sig_sim >= 0.90 or (shared_entities >= 4 and title_sim >= 0.88)
+        elif exact_key:
+            # کلید عمومی/اشتباه مدل به‌تنهایی خبر تازه را حذف نمی‌کند.
+            related = full_sim >= 0.84 or sig_sim >= 0.80 or (shared_entities >= 3 and title_sim >= 0.72)
+        elif full_sim >= full_threshold:
             related = True
-        elif full_sim >= DEDUP_SIMILARITY_THRESHOLD:
+        elif sig_sim >= signature_threshold:
             related = True
-        elif sig_sim >= EVENT_SIMILARITY_THRESHOLD:
-            related = True
-        elif shared_entities >= 2 and same_bucket and (same_event_type or title_sim >= 0.52):
-            related = True
-        elif shared_entities >= 3 and same_bucket:
+        elif shared_entities >= entity_threshold and same_bucket and (same_event_type or title_sim >= title_anchor):
             related = True
 
         if not related:
@@ -3059,10 +3141,10 @@ def compare_event_relation(state, item, existing_items):
 
         # Once the allowed daily update budget is used, new reports of that same
         # event are treated as duplicate rather than endlessly refreshing the queue.
-        if update_limit_reached(existing):
+        if update_limit_reached(existing, state):
             return "duplicate"
 
-        if is_update and novelty >= EVENT_UPDATE_MIN_NOVELTY:
+        if is_update and novelty >= novelty_threshold:
             return "update"
         return "duplicate"
 
@@ -3271,18 +3353,10 @@ def queue_relation(state, item):
         return "new", None
     relation = compare_event_relation(state, item, queue)
     if relation == "update":
-        # همان event موجود در صف را برای update تازه پیدا کن.
+        # همان موردی را پیدا کن که ارزیاب کامل رویداد آن را update دانسته است.
+        # در پروفایل جنگ، event_key به‌تنهایی مجوز ادغام نیست.
         for idx, existing in enumerate(queue):
-            key_match = (
-                normalize_event_key(item.get("event_key", ""))
-                and normalize_event_key(item.get("event_key", ""))
-                == normalize_event_key(existing.get("event_key", ""))
-            )
-            sig_match = token_similarity(
-                event_signature(f"{item.get('title','')} {item.get('body','')}"),
-                event_signature(f"{existing.get('title','')} {existing.get('body','')}"),
-            ) >= EVENT_SIMILARITY_THRESHOLD
-            if key_match or sig_match:
+            if compare_event_relation(state, item, [existing]) == "update":
                 return "update", idx
         return "update", None
     if relation == "duplicate":
@@ -3290,7 +3364,7 @@ def queue_relation(state, item):
     return "new", None
 
 
-def enqueue_item(state, item):
+def enqueue_item(state, item, force=False):
     queue = state.setdefault("_pending_queue", [])
     item = dict(item)
     item["event_key"] = normalize_event_key(item.get("event_key", "")) or event_key_or_signature(
@@ -3306,13 +3380,15 @@ def enqueue_item(state, item):
     item.setdefault("entities", [])
     item["fingerprint"] = item_fingerprint(item)
 
-    # exact fingerprint duplicate
-    if any(x.get("fingerprint") == item["fingerprint"] for x in queue):
-        return False
-
-    relation, index = queue_relation(state, item)
-    if relation == "duplicate":
-        return False
+    # Explicit manager restoration bypasses dedup gates; ordinary intake remains protected.
+    if not force:
+        if any(x.get("fingerprint") == item["fingerprint"] for x in queue):
+            return False
+        relation, index = queue_relation(state, item)
+        if relation == "duplicate":
+            return False
+    else:
+        relation, index = "new", None
 
     if relation == "update" and index is not None:
         # update جدید جایگزین نسخه قبلی در صف می‌شود؛ ترتیب زمانی صف حفظ می‌شود.
@@ -3338,6 +3414,8 @@ def enqueue_item(state, item):
 
 
 def compute_publish_spacing_minutes(now_dt, state=None):
+    if state is not None and state.get("_profile") == "war":
+        return 0
     settings = admin_settings(state) if state is not None else {}
     start_hour = safe_int(settings.get("active_start_hour", 8), 8)
     afternoon_hour = safe_int(settings.get("afternoon_start_hour", 14), 14)
@@ -3359,7 +3437,11 @@ def choose_next_queue_item(state):
     if pinned_id:
         for pin_index, pin_item in enumerate(queue):
             eligible_status = pin_item.get("delivery_status", "queued") not in {"sending", "uncertain", "partial", "sent"}
-            eligible_time = not safe_float(pin_item.get("scheduled_at", 0), 0) or safe_float(pin_item.get("scheduled_at", 0), 0) <= now_ts()
+            eligible_time = (
+                state.get("_profile") == "war"
+                or not safe_float(pin_item.get("scheduled_at", 0), 0)
+                or safe_float(pin_item.get("scheduled_at", 0), 0) <= now_ts()
+            )
             if (str(pin_item.get("admin_id", "")) == pinned_id and eligible_status and eligible_time
                     and not safe_bool(pin_item.get("manual_approval_required"))
                     and safe_int(pin_item.get("news_score"), 0) >= MIN_NEWS_SCORE):
@@ -3369,7 +3451,7 @@ def choose_next_queue_item(state):
     candidates = []
     for index, item in enumerate(queue):
         scheduled_at = safe_float(item.get("scheduled_at", 0), 0)
-        if scheduled_at and scheduled_at > now_ts():
+        if state.get("_profile") != "war" and scheduled_at and scheduled_at > now_ts():
             continue
         if item.get("delivery_status") in {"sending", "uncertain", "partial", "sent"}:
             continue
@@ -3464,7 +3546,7 @@ def _process_queue_unlocked(state):
         return
 
     daily_limit = max(0, safe_int(settings.get("daily_post_limit", 0), 0))
-    if daily_limit and published_count_today(state) >= daily_limit:
+    if daily_limit and published_count_today(state) >= daily_limit and state.get("_profile") != "war":
         return
 
     spacing = compute_publish_spacing_minutes(now_dt, state)
@@ -3565,8 +3647,29 @@ def _process_queue_unlocked(state):
 
 
 def process_queue(state):
+    """Normal profile sends one item per cycle; war profile drains the eligible queue.
+
+    A small transport interval is retained to avoid flooding Telegram; it is not an
+    editorial publishing timer. 429/uncertain/error states stop the drain immediately.
+    """
     with STATE_LOCK:
-        return _process_queue_unlocked(state)
+        if state.get("_profile") != "war":
+            return _process_queue_unlocked(state)
+        sent = 0
+        max_per_cycle = max(1, min(100, env_int("WAR_MAX_PUBLISH_PER_CYCLE", 30)))
+        transport_gap = max(0.8, min(2.0, env_float("WAR_TRANSPORT_GAP_SECONDS", 1.1)))
+        while sent < max_per_cycle and state.get("_pending_queue"):
+            before_release = safe_float(state.get("_last_queue_release_ts"), 0)
+            before_len = len(state.get("_pending_queue", []))
+            _process_queue_unlocked(state)
+            after_release = safe_float(state.get("_last_queue_release_ts"), 0)
+            after_len = len(state.get("_pending_queue", []))
+            if after_release <= before_release or after_len >= before_len:
+                break
+            sent += 1
+            if sent < max_per_cycle and state.get("_pending_queue"):
+                time.sleep(transport_gap)
+        return sent
 
 
 # ============================================================
@@ -3602,9 +3705,20 @@ def _process_cluster_unlocked(state, source_key, cluster):
     for draft in drafts:
         title_for_log = draft.get("title") or "ورودی بدون تیتر"
         if not draft.get("relevant"):
-            record_decision(state, title_for_log, "رد‌شده", draft.get("duplicate_reason") or "AI خبر را مرتبط/قابل انتشار ندانست", draft.get("news_score"))
+            reject_reason = draft.get("duplicate_reason") or "AI خبر را مرتبط/قابل انتشار ندانست"
+            record_decision(state, title_for_log, "رد‌شده", reject_reason, draft.get("news_score"))
+            draft_index = safe_int(draft.get("draft_id"), 0)
+            source_candidates = [cluster[draft_index - 1]] if 1 <= draft_index <= len(cluster) else cluster[:1]
+            for raw_post in source_candidates:
+                record_rejected_news(state, {
+                    "title": raw_post.get("title", ""), "body": raw_post.get("text", ""),
+                    "source_channels": [str(raw_post.get("_source_key", source_key)).replace("tg:", "")],
+                    "source_urls": [raw_post.get("source_url", "")] if raw_post.get("source_url") else [],
+                    "source_url": raw_post.get("source_url", ""), "source_uids": [raw_post.get("uid")] if raw_post.get("uid") else [],
+                    "photo": raw_post.get("photo"), "video": raw_post.get("video"),
+                }, reject_reason, draft.get("news_score"))
         elif safe_bool(draft.get("duplicate")):
-            record_decision(state, title_for_log, "رد‌شده", draft.get("duplicate_reason") or "تشخیص تکراری توسط AI", draft.get("news_score"))
+            log.info("AI خروجی را مشکوک به تکرار علامت زد؛ تصمیم نهایی به تطبیق محلی واگذار شد: %s", title_for_log)
     drafts = [x for x in drafts if x.get("relevant")]
     if not drafts:
         save_state(state)
@@ -3646,14 +3760,7 @@ def _process_cluster_unlocked(state, source_key, cluster):
     for result in edited_items[:EVENT_MAX_OUTPUT_ITEMS]:
         if not result.get("relevant"):
             continue
-        if safe_bool(result.get("duplicate")):
-            log.info(
-                "AI خروجی را duplicate تشخیص داد و منتشر نشد: %s",
-                result.get("title", "")
-            )
-            successful_interpretation = True
-            continue
-
+        # `duplicate` from the model is advisory only; a local high-confidence match is required.
         linked_indices = [
             idx for idx in result.get("post_indices", [])
             if 1 <= safe_int(idx, 0) <= len(cluster)
@@ -3716,7 +3823,9 @@ def _process_cluster_unlocked(state, source_key, cluster):
 
         if not is_allowed_content_bucket(item["content_bucket"]):
             log.info("خبر خارج از سبد محتوایی حذف شد: %s", title)
-            record_decision(state, title, "رد‌شده", "خارج از سبد محتوایی مجاز", item["news_score"])
+            reason = "خارج از سبد محتوایی مجاز"
+            record_decision(state, title, "رد‌شده", reason, item["news_score"])
+            record_rejected_news(state, item, reason, item["news_score"])
             successful_interpretation = True
             continue
 
@@ -3729,13 +3838,17 @@ def _process_cluster_unlocked(state, source_key, cluster):
         # update واقعی فقط در صورت novelty مناسب و سقف روزانه انجام می‌شود.
         if relation == "duplicate":
             log.info("خروجی تکراری/بدون اطلاعات تازه رد شد: %s", title)
-            record_decision(state, title, "رد‌شده", "با حافظه رویدادها/خبرهای منتشرشده تکراری تشخیص داده شد", item["news_score"])
+            reason = "با حافظه رویدادها/خبرهای منتشرشده تکراری تشخیص داده شد"
+            record_decision(state, title, "رد‌شده", reason, item["news_score"])
+            record_rejected_news(state, item, reason, item["news_score"])
             successful_interpretation = True
             continue
 
         if relation == "update" and item["novelty_score"] < EVENT_UPDATE_MIN_NOVELTY:
             log.info("update با novelty پایین رد شد: %s", title)
-            record_decision(state, title, "رد‌شده", "به‌روزرسانی اطلاعات تازه کافی نداشت", item["news_score"])
+            reason = "به‌روزرسانی اطلاعات تازه کافی نداشت"
+            record_decision(state, title, "رد‌شده", reason, item["news_score"])
+            record_rejected_news(state, item, reason, item["news_score"])
             successful_interpretation = True
             continue
 
@@ -3749,7 +3862,9 @@ def _process_cluster_unlocked(state, source_key, cluster):
             successful_interpretation = True
         else:
             log.info("آیتم به علت duplicate/update صفی کنار گذاشته شد: %s", title)
-            record_decision(state, title, "رد‌شده", "تکراری/به‌روزرسانی مشابه مورد موجود در صف", item["news_score"])
+            reason = "تکراری/به‌روزرسانی مشابه مورد موجود در صف"
+            record_decision(state, title, "رد‌شده", reason, item["news_score"])
+            record_rejected_news(state, item, reason, item["news_score"])
             successful_interpretation = True
 
     if not successful_interpretation:
@@ -3829,8 +3944,9 @@ def _check_scheduled_messages_unlocked(state):
     configured_end = safe_int(settings.get("active_end_hour", 24), 24)
     end_message_hour = configured_end % 24  # پایان 24 یعنی ساعت صفر روز بعد
 
-    # پیام‌های آغاز/پایان روز نیز از برنامه زمانی پنل پیروی می‌کنند.
-    if scheduled_posts_enabled and now.hour == start_hour and state.get("_last_morning_date") != today_str:
+    # پیام‌های خوشامد و پاک‌سازی شبانه در حالت جنگ نباید صف خبر را مختل کنند.
+    normal_profile = state.get("_profile") != "war"
+    if normal_profile and scheduled_posts_enabled and now.hour == start_hour and state.get("_last_morning_date") != today_str:
         try:
             send_text_to_telegram(MORNING_MESSAGE)
             state["_last_morning_date"] = today_str
@@ -3839,7 +3955,7 @@ def _check_scheduled_messages_unlocked(state):
         except Exception as exc:
             log.error("ارسال پیام آغاز بازه فعالیت شکست خورد: %s", sanitize_error_text(exc))
 
-    if scheduled_posts_enabled and now.hour == end_message_hour:
+    if normal_profile and scheduled_posts_enabled and now.hour == end_message_hour:
         # اگر فعالیت دقیقاً از ساعت صفر تا پایان 24 تنظیم شده باشد، پیام آغاز و پایان هم‌زمان نشوند.
         if end_message_hour != start_hour and state.get("_last_night_date") != today_str:
             try:
@@ -4002,6 +4118,13 @@ def process_once(state):
                         state[source_key] = current[-500:]
                     save_state(state)
             if duplicate_input:
+                record_rejected_news(state, {
+                    "title": post.get("title", ""), "body": post.get("text", ""),
+                    "source_channels": [str(post.get("_source_key", "")).replace("tg:", "")],
+                    "source_urls": [post.get("source_url", "")] if post.get("source_url") else [],
+                    "source_url": post.get("source_url", ""), "source_uids": [post.get("uid")] if post.get("uid") else [],
+                    "photo": post.get("photo"), "video": post.get("video"),
+                }, "ورودی بسیار مشابه با خبر دریافت‌شده قبلی", 0)
                 continue
             filtered_new_posts.append(post)
 
@@ -4220,6 +4343,85 @@ def record_admin_activity(state, user_id, action, detail=""):
     state["_admin_activity"] = entries[-MAX_ADMIN_LOGS:]
 
 
+def record_rejected_news(state, item, reason, score=None):
+    """Persist a manager-reviewable snapshot of a rejected news candidate."""
+    if not isinstance(item, dict):
+        return None
+    title = normalize_space(str(item.get("title", "") or item.get("text", "").split("\n", 1)[0]))[:240]
+    body = normalize_persian_text(str(item.get("body", "") or item.get("text", "")))[:6500]
+    if not title and not body:
+        return None
+    entries = state.setdefault("_rejected_news", [])
+    fingerprint = sha1_text(normalize_for_match(title + " " + body))[:20]
+    existing = next((x for x in entries if x.get("fingerprint") == fingerprint and x.get("status", "rejected") == "rejected"), None)
+    if existing:
+        existing["last_rejected_at"] = now_ts()
+        existing["rejection_count"] = safe_int(existing.get("rejection_count"), 1) + 1
+        existing["reason"] = sanitize_error_text(reason)[:240]
+        return existing
+    snapshot = {
+        "rejected_id": uuid.uuid4().hex[:12],
+        "fingerprint": fingerprint,
+        "title": title or "خبر بدون تیتر",
+        "body": body,
+        "reason": sanitize_error_text(reason)[:240],
+        "news_score": safe_int(score if score is not None else item.get("news_score"), 0),
+        "region": item.get("region", "world"),
+        "content_bucket": item.get("content_bucket", "world"),
+        "event_type": item.get("event_type", "routine"),
+        "verification": item.get("verification", "reported"),
+        "important": safe_bool(item.get("important")),
+        "urgent": safe_bool(item.get("urgent")),
+        "source_channels": list(item.get("source_channels", []))[:20] if isinstance(item.get("source_channels"), list) else [],
+        "source_urls": list(item.get("source_urls", []))[:20] if isinstance(item.get("source_urls"), list) else [],
+        "source_url": str(item.get("source_url", ""))[:500],
+        "source_uids": list(item.get("source_uids", []))[:20] if isinstance(item.get("source_uids"), list) else [],
+        "photo": item.get("photo"), "video": item.get("video"), "photo_file_id": item.get("photo_file_id"),
+        "entities": list(item.get("entities", []))[:10] if isinstance(item.get("entities"), list) else [],
+        "event_key": str(item.get("event_key", ""))[:140],
+        "novelty_score": safe_int(item.get("novelty_score"), 0),
+        "created_at": now_ts(), "last_rejected_at": now_ts(), "status": "rejected", "rejection_count": 1,
+    }
+    entries.append(snapshot)
+    state["_rejected_news"] = entries[-500:]
+    return snapshot
+
+
+def restore_rejected_news(state, rejected_id, user_id):
+    entries = state.setdefault("_rejected_news", [])
+    record = next((x for x in entries if str(x.get("rejected_id")) == str(rejected_id) and x.get("status", "rejected") == "rejected"), None)
+    if not record:
+        raise ValueError("خبر ردشده پیدا نشد یا قبلاً بازگردانده شده است.")
+    item = {k: copy.deepcopy(v) for k, v in record.items() if k not in {"rejected_id", "fingerprint", "reason", "created_at", "last_rejected_at", "status", "rejection_count"}}
+    item["title"] = normalize_persian_text(item.get("title", ""))[:240]
+    item["body"] = normalize_persian_text(item.get("body", ""))[:6500]
+    if not item["title"] or not item["body"]:
+        raise ValueError("متن خبر برای بازگرداندن کافی نیست؛ این مورد را فقط می‌توان مشاهده کرد.")
+    item.update({
+        "admin_id": uuid.uuid4().hex[:12],
+        "queued_at": now_ts(),
+        "delivery_status": "queued",
+        "scheduled_at": 0,
+        "manual_priority": 100000,
+        "manual_approval_required": False,
+        "manual_restore": True,
+        "manual_restored_by": safe_int(user_id, 0),
+        "manual_restored_at": now_ts(),
+        "news_score": max(MIN_NEWS_SCORE, safe_int(item.get("news_score"), MIN_NEWS_SCORE)),
+        "event_key": normalize_event_key(item.get("event_key", "")) or event_key_or_signature(item["title"], item["body"]),
+    })
+    if not enqueue_item(state, item, force=True):
+        raise ValueError("خبر وارد صف نشد؛ صف را بررسی کن و دوباره تلاش کن.")
+    record["status"] = "restored"
+    record["restored_at"] = now_ts()
+    record["restored_by"] = safe_int(user_id, 0)
+    record["restored_admin_id"] = item["admin_id"]
+    record_decision(state, item["title"], "بازگشت دستی به صف", "مدیر خبر ردشده را به‌صورت دستی تأیید و به صف بازگرداند.", item["news_score"])
+    record_admin_activity(state, user_id, "بازگرداندن خبر ردشده", item["title"])
+    save_state(state)
+    return item
+
+
 def record_decision(state, title, outcome, reason, score=None):
     entries = state.setdefault("_recent_decisions", [])
     entries.append({
@@ -4371,22 +4573,16 @@ def admin_show_menu(chat_id, message_id=None, role="observer"):
         ]
     else:
         rows = [
-            [admin_button("📊 آمار و وضعیت ربات", "stats")],
-            [admin_button("⚙️ تنظیمات ربات", "settings")],
-            [admin_button("📰 مدیریت اخبار", "news")],
-            [admin_button("📥 مدیریت صف انتشار", "queue")],
+            [admin_button("📊 آمار و وضعیت ربات", "stats"), admin_button("⚙️ تنظیمات ربات", "settings")],
+            [admin_button("📰 مدیریت اخبار", "news"), admin_button("📡 مدیریت منابع", "sources")],
             [admin_button("🤖 مدیریت هوش مصنوعی", "ai")],
         ]
-        if role == "owner":
-            rows.append([admin_button("👥 مدیریت ادمین‌ها", "admins")])
         rows.extend([
-            [admin_button("📡 مدیریت منابع", "sources")],
-            [admin_button("📝 گزارش فعالیت‌ها", "logs")],
-            [admin_button("🛠 ابزارهای پیشرفته", "tools")],
+            [admin_button("📚 محتوای تحلیلی", "analytics")],
+            [admin_button("📝 گزارش فعالیت‌ها", "logs"), admin_button("🛠 عیب‌یابی و ابزارها", "tools")],
         ])
-    if role != "observer":
-        rows.append([admin_button("📚 محتوای تحلیلی V5.6", "analytics")])
-        rows.append([admin_button("🧰 قابلیت‌های V5.3", "v53")])
+    if role == "owner":
+        rows.append([admin_button("👥 مدیریت ادمین‌ها", "admins")])
     admin_render(chat_id, f"🦅 پنل مدیریت رپتور — نسخه {BOT_VERSION}\nیک بخش را انتخاب کن:", rows, message_id)
 
 
@@ -4429,7 +4625,11 @@ def render_stats(state, chat_id, message_id=None):
         f"ذخیره‌سازی: {'قابل‌نوشتن' if storage_ok else 'بررسی شود'}\n\n"
         "وضعیت ارائه‌دهندگان:\n" + "\n".join(p_lines)
     )
-    rows = [[admin_button("🔄 تازه‌سازی", "stats")], [admin_button("🩺 عیب‌یابی", "diagnose")], [admin_button("🏠 منوی اصلی", "menu")]]
+    rows = [
+        [admin_button("📈 تحلیل عملکرد", "metrics"), admin_button("📄 خروجی CSV", "exportcsv")],
+        [admin_button("🔄 تازه‌سازی", "stats"), admin_button("🩺 عیب‌یابی", "diagnose")],
+        [admin_button("🏠 منوی اصلی", "menu")],
+    ]
     admin_render(chat_id, text, rows, message_id)
 
 
@@ -4443,20 +4643,55 @@ def render_settings(state, chat_id, message_id=None):
         f"فاصله بازه اول: {st.get('morning_spacing_minutes', 60)} دقیقه\n"
         f"فاصله بازه دوم: {st.get('afternoon_spacing_minutes', 45)} دقیقه\n"
         f"{schedule}\n"
-        f"سقف روزانه: {st.get('daily_post_limit', 0) or 'بدون سقف'}\n\n"
-        "برای فاصله زمانی عدد دقیقه، برای ساعت‌های فعالیت سه عدد با ویرگول وارد کن: شروع,شروع‌بازه‌دوم,پایان (مثال: 8,14,24). پایان می‌تواند 24 باشد."
+        f"سقف روزانه: {st.get('daily_post_limit', 0) or 'بدون سقف'}\n"
+        f"پروفایل انتشار: {'جنگ' if state.get('_profile') == 'war' else 'عادی'}"
     )
     rows = [
-        [admin_button("🔁 تغییر انتشار خودکار", "setting|auto")],
-        [admin_button("🚨 توقف اضطراری", "setting|emergency")],
-        [admin_button("⏱ فاصله بازه اول", "setprompt|morning_spacing")],
-        [admin_button("⏱ فاصله بازه دوم", "setprompt|afternoon_spacing")],
+        [admin_button("🔁 انتشار خودکار", "setting|auto"), admin_button("🚨 توقف اضطراری", "setting|emergency")],
+        [admin_button("⏱ فاصله بازه اول", "setprompt|morning_spacing"), admin_button("⏱ فاصله بازه دوم", "setprompt|afternoon_spacing")],
         [admin_button("🕒 ساعات فعالیت", "setprompt|active_hours")],
         [admin_button("📈 سقف انتشار روزانه", "setprompt|daily_limit")],
+        [admin_button("✅ قوانین تأیید خودکار", "rules"), admin_button("🚫 بلاک‌لیست و کلیدواژه‌ها", "terms")],
+        [admin_button("⏸ تنظیمات توقف", "pausesettings"), admin_button("⚔️ حالت‌های انتشار", "modesettings")],
         [admin_button("♻️ بازنشانی تنظیمات", "confirm|resetsettings|1")],
-        [admin_button("⬅️ منوی اصلی", "menu")],
+        [admin_button("🏠 منوی اصلی", "menu")],
     ]
     admin_render(chat_id, text, rows, message_id)
+
+
+def render_pause_settings(state, chat_id, message_id=None):
+    paused_until = safe_float(state.get("_paused_until", 0), 0)
+    if paused_until > now_ts():
+        pause_text = datetime.fromtimestamp(paused_until, TEHRAN_TZ or timezone.utc).strftime("%Y-%m-%d %H:%M")
+    elif state.get("_pause_until_important"):
+        pause_text = "تا ورود خبر مهم/فوری"
+    else:
+        pause_text = "بدون توقف زمان‌دار"
+    silences = [x for x in state.get("_topic_silences", []) if isinstance(x, dict) and safe_float(x.get("until_ts"), 0) > now_ts()]
+    lines = [f"⏸ تنظیمات توقف\n\nوضعیت فعلی: {pause_text}", "\nسکوت‌های موضوعی فعال:"]
+    lines.extend([f"• {x.get('term','')} تا {datetime.fromtimestamp(safe_float(x.get('until_ts'),0), TEHRAN_TZ or timezone.utc):%m-%d %H:%M}" for x in silences[-10:]] or ["• مورد فعالی وجود ندارد"])
+    rows = [
+        [admin_button("🔕 سکوت موضوعی موقت", "silenceadd")],
+        [admin_button("⏸ توقف ۱ ساعته", "pause|1h"), admin_button("⏸ تا فردا ۷ صبح", "pause|tomorrow")],
+        [admin_button("⏸ توقف تا خبر مهم", "pause|important")],
+        [admin_button("▶️ ادامه انتشار", "resume")],
+        [admin_button("⬅️ بازگشت به تنظیمات", "settings")],
+    ]
+    admin_render(chat_id, "\n".join(lines), rows, message_id)
+
+
+def render_modes_settings(state, chat_id, message_id=None):
+    profile = "war" if state.get("_profile") == "war" else "normal"
+    rows = [
+        [admin_button(("🟢 " if profile == "normal" else "") + "حالت عادی", "profile|normal")],
+        [admin_button(("🟢 " if profile == "war" else "") + "حالت جنگ", "profile|war")],
+        [admin_button("⬅️ بازگشت به تنظیمات", "settings")],
+    ]
+    if profile == "war":
+        detail = "در حالت جنگ: زمان‌بندی فاصله‌ای حذف می‌شود، صف واجد شرایط با رعایت فاصله فنی تلگرام تخلیه می‌شود و فیلتر تکراری‌بودن محافظه‌کارانه‌تر عمل می‌کند."
+    else:
+        detail = "در حالت عادی: ساعات فعالیت و فاصله‌های انتشار مطابق تنظیمات عادی فعلی اجرا می‌شوند."
+    admin_render(chat_id, f"⚔️ حالت‌های انتشار\n\nحالت فعال: {'جنگ' if profile == 'war' else 'عادی'}\n\n{detail}", rows, message_id)
 
 
 def ensure_queue_ids(state):
@@ -4709,6 +4944,47 @@ def render_logs(state, chat_id, message_id=None):
     admin_render(chat_id, "\n".join(text_parts), rows, message_id)
 
 
+def render_rejected_news(state, chat_id, message_id=None, page=0):
+    entries = [x for x in state.get("_rejected_news", []) if isinstance(x, dict) and x.get("status", "rejected") == "rejected"]
+    entries.sort(key=lambda x: safe_float(x.get("last_rejected_at", x.get("created_at", 0)), 0), reverse=True)
+    start = max(0, page) * ADMIN_PAGE_SIZE
+    subset = entries[start:start + ADMIN_PAGE_SIZE]
+    rows = []
+    lines = [f"🧾 خبرهای ردشده و قابل بازبینی — {len(entries)} مورد", "با بازکردن هر مورد می‌توانی علت رد را ببینی و در صورت تأیید دستی آن را به صف برگردانی.", ""]
+    for item in subset:
+        title = normalize_space(item.get("title", "بدون تیتر"))[:54]
+        lines.append(f"• {title} | امتیاز {safe_int(item.get('news_score'), 0)} | {item.get('reason', 'بدون علت')[:90]}")
+        rows.append([admin_button(title[:48], f"rj|{item.get('rejected_id')}")])
+    nav = []
+    if page > 0:
+        nav.append(admin_button("◀️ قبلی", f"rejectedpage|{page-1}"))
+    if start + ADMIN_PAGE_SIZE < len(entries):
+        nav.append(admin_button("بعدی ▶️", f"rejectedpage|{page+1}"))
+    if nav: rows.append(nav)
+    rows.extend([[admin_button("⬅️ مدیریت اخبار", "news")], [admin_button("🏠 منوی اصلی", "menu")]])
+    if not entries: lines.append("فعلاً موردی در آرشیو ردشده‌ها ثبت نشده است. از این نسخه به بعد، ردهای قابل بازبینی در این فهرست ذخیره می‌شوند.")
+    admin_render(chat_id, "\n".join(lines), rows, message_id)
+
+
+def render_rejected_news_item(state, chat_id, rejected_id, message_id=None):
+    item = next((x for x in state.get("_rejected_news", []) if isinstance(x, dict) and str(x.get("rejected_id")) == str(rejected_id) and x.get("status", "rejected") == "rejected"), None)
+    if not item:
+        admin_render(chat_id, "این مورد در آرشیو ردشده‌ها وجود ندارد یا قبلاً بازگردانده شده است.", [[admin_button("خبرهای ردشده", "rejectednews")]], message_id)
+        return
+    stamp = safe_float(item.get("created_at"), 0)
+    when = datetime.fromtimestamp(stamp, TEHRAN_TZ or timezone.utc).strftime("%Y-%m-%d %H:%M") if stamp else "نامشخص"
+    body = format_public_body(item)
+    text = (f"📰 بررسی خبر ردشده\n\nتیتر: {item.get('title','')}\n\n{body}\n\n"
+            f"علت رد: {item.get('reason','ثبت نشده')}\nامتیاز اولیه: {safe_int(item.get('news_score'), 0)}\n"
+            f"زمان ثبت: {when}\nمنابع داخلی: {', '.join(item.get('source_channels', [])) or 'ثبت نشده'}\n"
+            f"وضعیت: فقط با اقدام دستی مدیر به صف برمی‌گردد.")
+    rows = []
+    if body.strip():
+        rows.append([admin_button("✅ تأیید دستی و بازگرداندن به صف", f"rrestore|{rejected_id}")])
+    rows.extend([[admin_button("⬅️ فهرست خبرهای ردشده", "rejectednews")], [admin_button("مدیریت اخبار", "news")]])
+    admin_render(chat_id, text, rows, message_id)
+
+
 def render_decisions(state, chat_id, message_id=None):
     decisions = list(reversed(state.get("_recent_decisions", [])[-18:]))
     lines = ["🧾 تصمیم‌های تحریریه — این لاگ از داده‌های پردازش‌شده ربات تشکیل می‌شود:"]
@@ -4719,7 +4995,7 @@ def render_decisions(state, chat_id, message_id=None):
         lines.append(f"• {when} | {item.get('outcome')}{score_text}\n  {item.get('title', '')}\n  علت: {item.get('reason', '')}")
     if not decisions:
         lines.append("\nهنوز تصمیمی ثبت نشده است؛ با چرخه‌های بعدی این فهرست پر می‌شود.")
-    admin_render(chat_id, "\n".join(lines), [[admin_button("⬅️ گزارش‌ها", "logs")], [admin_button("🏠 منوی اصلی", "menu")]], message_id)
+    admin_render(chat_id, "\n".join(lines), [[admin_button("🧾 بررسی خبرهای ردشده", "rejectednews")], [admin_button("⬅️ مدیریت اخبار", "news")], [admin_button("🏠 منوی اصلی", "menu")]], message_id)
 
 
 def render_tools(state, chat_id, message_id=None):
@@ -4790,7 +5066,8 @@ def deduplicate_queue_admin(state):
             similarity = combined_similarity(
                 item.get("title", ""), item.get("body", ""), old.get("title", ""), old.get("body", "")
             )
-            if similarity >= 0.94 and normalize_event_key(item.get("event_key", "")) == normalize_event_key(old.get("event_key", "")):
+            threshold = 0.995 if state.get("_profile") == "war" else 0.985
+            if similarity >= threshold and normalize_event_key(item.get("event_key", "")) == normalize_event_key(old.get("event_key", "")):
                 duplicate_index = idx
                 break
         if duplicate_index is None:
@@ -4810,7 +5087,7 @@ def edit_published_message(item):
     if not message_id:
         raise RuntimeError("شناسه پیام تلگرام ذخیره نشده است؛ این رکورد از نسخه جدید یا پیام قابل‌ویرایش نیست.")
     if item.get("media_type") in {"photo", "video"}:
-        text = build_media_caption(item.get("title", ""), item.get("body", ""), 1024)
+        text = build_media_caption(format_public_title(item), format_public_body(item), 1024)
         method = "editMessageCaption"
         data = {"chat_id": item.get("chat_id", TARGET_CHAT_ID), "message_id": message_id, "caption": text,
                 "caption_entities": json.dumps(caption_bold_entities(text))}
@@ -4834,7 +5111,7 @@ def edit_published_media(item):
     media_type = "photo" if media else ""
     if not media:
         raise RuntimeError("برای این رکورد URL یا file_id عکس ذخیره نشده است؛ می‌توانی پست را حذف کنی و خبر را دوباره منتشر کنی.")
-    caption = build_media_caption(item.get("title", ""), item.get("body", ""), 1024)
+    caption = build_media_caption(format_public_title(item), format_public_body(item), 1024)
     input_media = {"type": media_type, "media": media, "caption": caption,
                    "caption_entities": caption_bold_entities(caption)}
     return telegram_request("editMessageMedia", data={
@@ -5001,7 +5278,7 @@ def handle_admin_text(state, user_id, chat_id, text):
         elif text.startswith("/find"):
             bits = text.split(maxsplit=1)
             if len(bits) != 2 or not bits[1].strip().isdigit():
-                admin_render(chat_id, "قالب دستور: /find 12345", [[admin_button("V5.3", "v53")]])
+                admin_render(chat_id, "قالب دستور: /find 12345", [[admin_button("منوی اصلی", "menu")]])
             else:
                 render_find_message(state, chat_id, bits[1].strip())
         elif text.startswith("/exportcsv"):
@@ -5131,7 +5408,9 @@ def handle_admin_text(state, user_id, chat_id, text):
             if not project: raise ValueError("پروژه پیدا نشد.")
             project["pending_addendum_request"] = text
             try:
+                analytics_apply_ai_runtime(state, project)
                 analytics_v55.research_addendum(project, text)
+                project.pop("_ai_runtime", None)
             except Exception as exc:
                 project["last_error"] = sanitize_error_text(exc); analytics_save(state); clear_admin_session(state, user_id)
                 admin_render(chat_id, "تکمیل تحقیق ناموفق بود؛ مقاله قبلی حفظ شد. در صورت نیاز، جایگزین را صریحاً انتخاب کن.\n" + project["last_error"],
@@ -5187,7 +5466,9 @@ def handle_admin_text(state, user_id, chat_id, text):
             project, post = analytics_project_post(state, session.get("project_id"), session.get("post_id"))
             if not project or not post: raise ValueError("پروژه یا پست پیدا نشد.")
             if len(text.strip()) < 3: raise ValueError("دستور بازنویسی خیلی کوتاه است.")
+            analytics_apply_ai_runtime(state, project)
             analytics_v55.rewrite_post(project, post["id"], text.strip(), actor=user_id)
+            project.pop("_ai_runtime", None)
             analytics_save(state); clear_admin_session(state, user_id)
             analytics_show_post(state, chat_id, project["id"], post["id"], user_id=user_id)
         elif mode == "analytics_image_query":
@@ -5207,11 +5488,17 @@ def handle_admin_text(state, user_id, chat_id, text):
             project["status"]="researching"; analytics_save(state)
             admin_render(chat_id,"🔎 تحقیق اینترنتی و تحلیل Gemini آغاز شد. اگر جست‌وجو یا Gemini شکست بخورد، پروژه در وضعیت خطا می‌ماند و چیزی منتشر نمی‌شود.")
             try:
+                analytics_apply_ai_runtime(state, project)
                 analytics_v55.research_project(project)
+                project.pop("_ai_runtime", None)
                 analytics_save(state); clear_admin_session(state,user_id)
                 admin_render(chat_id,f"تحقیق آماده بازبینی است.\nپروژه: {project['title']}\nنتایج جست‌وجو: {len(project.get('sources',[]))}\n\n{project.get('article','')[:2500]}",[[admin_button("📄 مشاهده مقاله کامل","aarticle|"+project["id"])],[admin_button("🔗 بررسی منابع","asources|"+project["id"])],[admin_button("✅ تأیید مقاله و ساخت پست‌ها","aresearchok|"+project["id"])],[admin_button("❌ رد تحقیق","areject|"+project["id"])],[admin_button("پروژه‌ها","alist")]])
             except Exception as exc:
-                project["status"]="error"; project["last_error"]=sanitize_error_text(exc); project.setdefault("errors",[]).append({"at":now_ts(),"error":project["last_error"]}); analytics_save(state); clear_admin_session(state,user_id)
+                if analytics_try_queue_unavailable(state, project, "research", exc, user_id):
+                    clear_admin_session(state,user_id)
+                    admin_render(chat_id,"📥 پروژه تحقیقاتی در صف انتظار AI ثبت شد. به محض دسترس‌پذیری یکی از ارائه‌دهندگان فعال، تحقیق به‌صورت خودکار ادامه پیدا می‌کند؛ نیازی به ارسال دوباره موضوع نیست.", [[admin_button("مشاهده پروژه", "aopen|"+project["id"])],[admin_button("صف پروژه‌ها", "alist|all")]])
+                    return
+                project["status"]="error"; project["last_error"]=sanitize_error_text(exc); project.setdefault("errors",[]).append({"at":now_ts(),"error":project["last_error"]}); project.pop("_ai_runtime", None); analytics_save(state); clear_admin_session(state,user_id)
                 admin_render(chat_id,"❌ تحقیق متوقف شد؛ مقاله ناقص ساخته یا منتشر نشد.\n"+project["last_error"],
                              [[admin_button("تلاش دوباره با Gemini", "aresearchretry|" + project["id"])],
                               [admin_button("درخواست جایگزین Groq", "afallbackresearch|" + project["id"] + "|groq"), admin_button("درخواست جایگزین Mistral", "afallbackresearch|" + project["id"] + "|mistral")],
@@ -5220,12 +5507,18 @@ def handle_admin_text(state, user_id, chat_id, text):
             project=analytics_v55.new_project(state,"source_text",text,user_id)
             project["status"]="converting"; analytics_save(state)
             try:
+                analytics_apply_ai_runtime(state, project)
                 analytics_v55.split_into_posts(project)
                 analytics_v55.attach_images(project)
+                project.pop("_ai_runtime", None)
                 analytics_save(state); clear_admin_session(state,user_id)
                 analytics_open(state,chat_id,project["id"])
             except Exception as exc:
-                project["status"]="error"; project["last_error"]=sanitize_error_text(exc); project.setdefault("errors",[]).append({"at":now_ts(),"error":project["last_error"]}); analytics_save(state); clear_admin_session(state,user_id)
+                if analytics_try_queue_unavailable(state, project, "split", exc, user_id):
+                    clear_admin_session(state,user_id)
+                    admin_render(chat_id,"📥 متن ورودی در صف انتظار AI ثبت شد. به محض دسترس‌پذیری ارائه‌دهنده فعال، تبدیل متن و ساخت پست‌ها خودکار ادامه پیدا می‌کند؛ نیازی به ارسال دوباره متن نیست.", [[admin_button("مشاهده پروژه", "aopen|"+project["id"])],[admin_button("صف پروژه‌ها", "alist|all")]])
+                    return
+                project["status"]="error"; project["last_error"]=sanitize_error_text(exc); project.setdefault("errors",[]).append({"at":now_ts(),"error":project["last_error"]}); project.pop("_ai_runtime", None); analytics_save(state); clear_admin_session(state,user_id)
                 admin_render(chat_id,"❌ تبدیل متن ناموفق بود؛ پروژه و متن ورودی ذخیره شد و منتشر نمی‌شود.\n"+project["last_error"],
                              [[admin_button("تلاش دوباره با Gemini", "aregenerate|" + project["id"])],
                               [admin_button("درخواست جایگزین Groq", "afallbackposts|" + project["id"] + "|groq"), admin_button("درخواست جایگزین Mistral", "afallbackposts|" + project["id"] + "|mistral")],
@@ -6023,9 +6316,149 @@ def analytics_maybe_auto_schedule(state, project):
         return None
 
 
-def analytics_process_due(state):
-    """Publish only one due analytics item per loop; news scheduling is not changed."""
+def analytics_apply_ai_runtime(state, project):
+    """Pass current panel provider switches/order into the isolated analytics subsystem."""
+    st = analytics_v55.ensure_state(state)["settings"]
+    order = runtime_provider_order(state)
+    project["_ai_runtime"] = {
+        "auto_failover": bool(st.get("auto_failover", False)),
+        "provider_order": list(order),
+        "enabled_providers": list(order),
+        "enforce_enabled": True,
+        "manual_provider_override": bool(project.get("ai_provider_override_manual")),
+    }
+    return project
+
+
+def analytics_has_enabled_provider(state, project=None):
+    """Return whether this project has at least one configured, enabled, non-cooling provider."""
+    settings = analytics_v55.ensure_state(state)["settings"]
+    enabled = runtime_provider_order(state)
+    primary = str((project or {}).get("ai_provider_override") or "gemini").lower()
+    auto_failover = bool(settings.get("auto_failover", False))
+    manual_override = bool((project or {}).get("ai_provider_override_manual"))
+    if auto_failover:
+        candidates = list(dict.fromkeys(([primary] if primary in AI_PROVIDER_ORDER else []) + enabled))
+        candidates = [x for x in candidates if x in enabled]
+    elif manual_override:
+        candidates = [primary] if primary in AI_PROVIDER_ORDER else []
+    else:
+        candidates = [primary] if primary in enabled else []
+    for provider in candidates:
+        if AI_PROVIDER_KEYS.get(provider):
+            ps = provider_state(state, provider)
+            if safe_float(ps.get("cooldown_until"), 0) <= now_ts():
+                return True
+    return False
+
+
+def analytics_queue_task(state, project, operation, user_id=None, error=""):
+    task = analytics_v55.enqueue_ai_task(
+        state, project["id"], operation, owner_id=user_id, error=error,
+    )
+    project["_ai_runtime"] = {}
+    analytics_save(state)
+    return task
+
+
+def analytics_try_queue_unavailable(state, project, operation, exc, user_id=None):
+    settings = analytics_v55.ensure_state(state)["settings"]
+    if not settings.get("queue_when_ai_unavailable"):
+        return False
+    if not isinstance(exc, analytics_v55.AIUnavailableError):
+        return False
+    analytics_queue_task(state, project, operation, user_id, sanitize_error_text(exc))
+    return True
+
+
+def analytics_process_ai_queue(state):
+    """Resume persisted analytical research/conversion jobs when an enabled provider returns."""
     a = analytics_v55.ensure_state(state)
+    # Recover an interrupted task after a worker restart. Do not immediately steal a
+    # recently-started task: a long but healthy provider call may still be running.
+    recovered = False
+    stale_before = now_ts() - 300
+    for interrupted in a.get("ai_queue", []):
+        if not isinstance(interrupted, dict) or interrupted.get("status") != "processing":
+            continue
+        if safe_float(interrupted.get("updated_at"), 0) > stale_before:
+            continue
+        interrupted["status"] = "queued"
+        interrupted["next_attempt_at"] = now_ts()
+        interrupted["updated_at"] = now_ts()
+        interrupted["last_error"] = "اجرای Worker هنگام پردازش متوقف شده بود؛ کار به صف انتظار بازگردانده شد."
+        interrupted_project = a.get("projects", {}).get(str(interrupted.get("project_id", "")))
+        if isinstance(interrupted_project, dict) and not interrupted_project.get("archived"):
+            interrupted_project["status"] = "queued_ai"
+            interrupted_project["last_error"] = interrupted["last_error"]
+            interrupted_project.pop("_ai_runtime", None)
+        recovered = True
+    if recovered:
+        analytics_save(state)
+    pending = sorted(
+        [x for x in a.get("ai_queue", []) if isinstance(x, dict) and x.get("status") == "queued" and safe_float(x.get("next_attempt_at"), 0) <= now_ts()],
+        key=lambda x: (safe_float(x.get("created_at"), 0), str(x.get("id", ""))),
+    )
+    if not pending:
+        return
+    task = pending[0]
+    project = a["projects"].get(str(task.get("project_id", "")))
+    if not project or project.get("archived") or project.get("status") in {"cancelled", "rejected", "archived"}:
+        task["status"] = "cancelled"
+        task["updated_at"] = now_ts()
+        analytics_save(state)
+        return
+    if not analytics_has_enabled_provider(state, project):
+        return
+    analytics_apply_ai_runtime(state, project)
+    task["status"] = "processing"
+    task["attempts"] = safe_int(task.get("attempts"), 0) + 1
+    task["updated_at"] = now_ts()
+    project["status"] = "researching" if task.get("operation") == "research" else "converting"
+    analytics_save(state)
+    try:
+        if task.get("operation") == "research":
+            analytics_v55.research_project(project)
+        elif task.get("operation") == "split":
+            analytics_v55.split_into_posts(project)
+            analytics_v55.attach_images(project)
+        else:
+            raise analytics_v55.AnalyticsError("عملیات ذخیره‌شده در صف پشتیبانی نمی‌شود.")
+        task["status"] = "completed"
+        task["updated_at"] = now_ts()
+        task["last_error"] = ""
+        project.pop("queue_task_id", None)
+        project.pop("_ai_runtime", None)
+        project["last_error"] = ""
+        analytics_v55._append_history(project, "ai_task_completed", f"task={task.get('id')}")
+        analytics_save(state)
+        log.info("Analytics AI queue task completed | task=%s | project=%s | op=%s", task.get("id"), project.get("id"), task.get("operation"))
+    except analytics_v55.AIUnavailableError as exc:
+        task["status"] = "queued"
+        task["last_error"] = sanitize_error_text(exc)[:500]
+        task["updated_at"] = now_ts()
+        task["next_attempt_at"] = now_ts() + min(1800, 60 * (2 ** min(5, safe_int(task.get("attempts"), 1) - 1)))
+        project["status"] = "queued_ai"
+        project["last_error"] = task["last_error"]
+        project.pop("_ai_runtime", None)
+        analytics_save(state)
+        log.warning("Analytics AI task remains queued; providers unavailable | task=%s | retry_in=%ss", task.get("id"), int(task["next_attempt_at"] - now_ts()))
+    except Exception as exc:
+        task["status"] = "failed"
+        task["last_error"] = sanitize_error_text(exc)[:500]
+        task["updated_at"] = now_ts()
+        project["status"] = "error"
+        project["last_error"] = task["last_error"]
+        project.pop("_ai_runtime", None)
+        analytics_v55._append_history(project, "ai_task_failed", f"task={task.get('id')}; {task['last_error'][:200]}")
+        analytics_save(state)
+        log.exception("Analytics AI queue task failed permanently | task=%s", task.get("id"))
+
+
+def analytics_process_due(state):
+    """Resume AI projects first, then publish at most one due analytics item."""
+    a = analytics_v55.ensure_state(state)
+    analytics_process_ai_queue(state)
     if a["settings"].get("paused") or is_test_mode(state): return
     due = analytics_v55.due_posts(state)
     if not due: return
@@ -6078,18 +6511,19 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
         "aienable": "ai", "aiprimary": "ai", "admins": "admins", "adminadd": "admins", "adminrole": "admins", "sources": "sources", "sourceadd": "sources",
         "logs": "logs", "decisions": "decisions", "tools": "diagnose" if role == "observer" else "tools", "diagnose": "diagnose", "testmode": "tools", "dedupqueue": "queue", "confirm": "settings",
         "aitest": "ai", "primary": "ai", "do": "stats",
-        "v53": "tools", "pause": "tools", "resume": "tools", "profile": "tools",
-        "blockadd": "tools", "keyadd": "tools", "silenceadd": "tools", "sourcetoggle": "sources",
-        "sourcestats": "sources", "metrics": "tools", "historysearch": "news", "exportcsv": "news",
+        "v53": "settings", "pause": "settings", "resume": "settings", "profile": "settings",
+        "blockadd": "settings", "keyadd": "settings", "silenceadd": "settings", "sourcetoggle": "sources",
+        "sourcestats": "sources", "metrics": "stats", "historysearch": "news", "exportcsv": "stats",
         "qexact": "queue", "qbump": "queue", "qpin": "queue", "qrewrite": "queue", "qrewritecustom": "queue", "qsources": "queue", "qresolve": "queue", "qverify": "queue",
-        "find": "news", "terms": "tools", "ruleadd": "tools", "rules": "tools", "ruletoggle": "tools", "ruledelete": "tools", "rulesgate": "tools", "qapprove": "queue",
+        "rejectednews": "news", "rejectedpage": "news", "rj": "news", "rrestore": "news",
+        "find": "news", "terms": "settings", "ruleadd": "settings", "rules": "settings", "ruletoggle": "settings", "ruledelete": "settings", "rulesgate": "settings", "qapprove": "queue",
     }
     area_by_action.update({name: "analytics" for name in (
         "anewfile", "asearch", "acalendar", "areport", "agallery", "aaddprojimg", "agprev",
         "aresearchupdate", "aresearchretry", "afallbackresearch", "aregenprompt", "aregenerate",
         "aapprovepost", "adraftpost", "arejectpost", "apreview", "apostversions", "aassignimg", "aeditpost", "arewrite", "abulkclear", "aeditarticle", "aedittitle", "arewritecustom", "aimagequery", "aimgup", "aimgdown", "afallbackposts", "afallbackrewrite", "afallbackaddendum",
         "aremoveimg", "aimgswap", "aimagepolicy", "asingle", "aunschedule", "apublishprompt",
-        "apublishnow", "acancelprompt", "aarchiveprompt", "aarchive", "abulk", "abulktoggle",
+        "apublishnow", "acancelprompt", "aarchiveprompt", "aarchive", "abulk", "abulktoggle", "aifailover", "aiqueue", "aifailover", "aiqueue",
         "abulkapprove", "abulkdraft", "abulkreject", "abulkcancelprompt", "abulkcancelconfirm", "abulkschedule", "abulkshift", "abulkprojecttoggle", "aprojecttoggle",
         "abulkarchiveprompt", "abulkarchiveconfirm", "aprojecthistory",
     )})
@@ -6104,13 +6538,13 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
     elif action in {"anewresearch", "anewtext", "anewfile"}:
         if action == "anewresearch":
             mode = "analytics_research_input"
-            prompt = "موضوع تحقیق را بفرست. ابتدا جست‌وجوی واقعی وب انجام می‌شود و پیش‌فرض تمام مراحل با Gemini است. در خطا هیچ انتشار خودکار انجام نمی‌شود؛ جایگزین فقط با انتخاب صریح مدیر فعال می‌شود."
+            prompt = "موضوع تحقیق را بفرست. ابتدا جست‌وجوی واقعی وب انجام می‌شود. ارائه‌دهنده پیش‌فرض Gemini است؛ در صورت روشن‌بودن Failover، هوش مصنوعی فعال بعدی خودکار جایگزین می‌شود. اگر صف انتظار AI روشن باشد، پروژه هنگام نبود ارائه‌دهنده در صف می‌ماند."
         elif action == "anewfile":
             mode = "analytics_file_input"
             prompt = "یک فایل TXT، MD، PDF یا DOCX حداکثر ۱۰ مگابایت بفرست. متن فایل استخراج و به پروژه مستقل تبدیل می‌شود."
         else:
             mode = "analytics_text_input"
-            prompt = "متن کامل یا یادداشت ورودی را بفرست؛ ربات آن را به پست‌های مستقل تبدیل می‌کند. سپس می‌توانی چند تصویر را در گالری پروژه وارد و به پست‌ها متصل کنی. برای لغو /cancel را بفرست."
+            prompt = "متن کامل یا یادداشت ورودی را بفرست؛ ربات آن را به پست‌های مستقل تبدیل می‌کند. اگر صف انتظار AI روشن باشد، در صورت نبود ارائه‌دهنده پروژه حذف نمی‌شود و بعداً خودکار ادامه می‌یابد. برای لغو /cancel را بفرست."
         ask_admin_input(state, user_id, chat_id, {"type": mode}, prompt, message_id)
     elif action == "asearch":
         ask_admin_input(state, user_id, chat_id, {"type": "analytics_search"}, "عنوان یا بخشی از موضوع پروژه را برای جست‌وجو بفرست.", message_id)
@@ -6149,8 +6583,10 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
             admin_render(chat_id, "مقاله‌ای برای تأیید وجود ندارد.", [[admin_button("پروژه‌ها", "alist|all")]], message_id)
         else:
             try:
+                analytics_apply_ai_runtime(state, p)
                 analytics_v55.split_into_posts(p)
                 analytics_v55.attach_images(p)
+                p.pop("_ai_runtime", None)
                 p["approved_article"] = True
                 analytics_save(state)
                 analytics_open(state, chat_id, parts[1], message_id)
@@ -6171,8 +6607,9 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
         p = analytics_v55.ensure_state(state)["projects"].get(parts[1])
         try:
             if not p: raise RuntimeError("پروژه پیدا نشد.")
-            p["ai_provider_override"] = "gemini"; p["status"] = "researching"
-            analytics_v55.research_project(p); analytics_save(state)
+            p["ai_provider_override"] = "gemini"; p["ai_provider_override_manual"] = True; p["status"] = "researching"
+            analytics_apply_ai_runtime(state, p)
+            analytics_v55.research_project(p); p.pop("_ai_runtime", None); analytics_save(state)
             admin_render(chat_id, "تحقیق دوباره با Gemini آماده بازبینی است.", [[admin_button("مشاهده مقاله", f"aarticle|{p['id']}|0")], [admin_button("پروژه", "aopen|" + p["id"])]], message_id)
         except Exception as exc:
             if p: p["status"] = "error"; p["last_error"] = sanitize_error_text(exc); analytics_save(state)
@@ -6184,8 +6621,9 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
             if provider not in {"groq", "mistral"}: raise RuntimeError("ارائه‌دهنده جایگزین نامعتبر است.")
             if not p: raise RuntimeError("پروژه پیدا نشد.")
             # Explicit administrator action only; never automatic failover.
-            p["ai_provider_override"] = provider; p["status"] = "researching"
-            analytics_v55.research_project(p); analytics_save(state)
+            p["ai_provider_override"] = provider; p["ai_provider_override_manual"] = True; p["status"] = "researching"
+            analytics_apply_ai_runtime(state, p)
+            analytics_v55.research_project(p); p.pop("_ai_runtime", None); analytics_save(state)
             admin_render(chat_id, f"تحقیق با درخواست صریح مدیر به {provider} منتقل شد و برای بازبینی آماده است.\nاین مرحله Grounding گوگل Gemini نیست.",
                          [[admin_button("مشاهده مقاله", f"aarticle|{p['id']}|0")], [admin_button("بازگشت به پروژه", "aopen|" + p["id"])]] , message_id)
         except Exception as exc:
@@ -6203,7 +6641,9 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
             if provider not in {"groq", "mistral"}: raise RuntimeError("ارائه‌دهنده نامعتبر است.")
             # Provider switch only occurs after an explicit click from the administrator.
             p["ai_provider_override"] = provider
-            analytics_v55.split_into_posts(p); analytics_v55.attach_images(p); analytics_save(state)
+            p["ai_provider_override_manual"] = True
+            analytics_apply_ai_runtime(state, p)
+            analytics_v55.split_into_posts(p); analytics_v55.attach_images(p); p.pop("_ai_runtime", None); analytics_save(state)
             analytics_open(state, chat_id, p["id"], message_id)
         except Exception as exc:
             if p: p["status"] = "error"; p["last_error"] = sanitize_error_text(exc); analytics_save(state)
@@ -6214,8 +6654,10 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
             if not p: raise RuntimeError("پروژه پیدا نشد.")
             if provider not in {"groq", "mistral"}: raise RuntimeError("ارائه‌دهنده نامعتبر است.")
             p["ai_provider_override"] = provider
+            p["ai_provider_override_manual"] = True
+            analytics_apply_ai_runtime(state, p)
             request_text = p.get("pending_addendum_request", "تکمیل اطلاعات پروژه")
-            analytics_v55.research_addendum(p, request_text); analytics_save(state)
+            analytics_v55.research_addendum(p, request_text); p.pop("_ai_runtime", None); analytics_save(state)
             admin_render(chat_id, f"تحقیق تکمیلی با انتخاب صریح {provider} آماده بازبینی است؛ انتشار انجام نشد.", [[admin_button("مشاهده مقاله", f"aarticle|{p['id']}|0")], [admin_button("پروژه", "aopen|" + p["id"])]] , message_id)
         except Exception as exc:
             if p: p["last_error"] = sanitize_error_text(exc); analytics_save(state)
@@ -6228,7 +6670,10 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
             if not p or not post: raise RuntimeError("پست پیدا نشد.")
             if provider not in {"groq", "mistral"}: raise RuntimeError("ارائه‌دهنده نامعتبر است.")
             p["ai_provider_override"] = provider
+            p["ai_provider_override_manual"] = True
+            analytics_apply_ai_runtime(state, p)
             analytics_v55.rewrite_post(p, post["id"], instructions.get(style, "متن را روان‌تر کن."), actor=user_id)
+            p.pop("_ai_runtime", None)
             analytics_save(state); analytics_show_post(state, chat_id, p["id"], post["id"], message_id, user_id)
         except Exception as exc: admin_render(chat_id, "بازنویسی با جایگزین ناموفق بود: " + sanitize_error_text(exc), [[admin_button("پست", f"apost|{parts[1]}|{parts[2]}")]], message_id)
     elif action == "aregenprompt" and len(parts) > 1:
@@ -6238,8 +6683,10 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
         p = analytics_v55.ensure_state(state)["projects"].get(parts[1])
         try:
             if not p: raise RuntimeError("پروژه پیدا نشد.")
+            analytics_apply_ai_runtime(state, p)
             analytics_v55.split_into_posts(p)
             analytics_v55.attach_images(p)
+            p.pop("_ai_runtime", None)
             analytics_save(state)
             analytics_open(state, chat_id, p["id"], message_id)
         except Exception as exc:
@@ -6391,7 +6838,9 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
         styles = {"short": "متن را کوتاه‌تر کن و فقط نکات اصلی را حفظ کن.", "expand": "توضیح را با تکیه بر اطلاعات موجود کمی روشن‌تر و کامل‌تر کن؛ واقعیت جدید اضافه نکن.", "formal": "لحن را رسمی‌تر و حرفه‌ای‌تر کن، بدون تغییر معنای اطلاعات.", "neutral": "لحن را طبیعی‌تر و متعادل‌تر کن."}
         try:
             if not p or not post: raise RuntimeError("پست پیدا نشد.")
+            analytics_apply_ai_runtime(state, p)
             analytics_v55.rewrite_post(p, parts[2], styles.get(parts[3], "متن را روان‌تر بازنویسی کن."), actor=user_id)
+            p.pop("_ai_runtime", None)
             analytics_save(state); analytics_show_post(state, chat_id, parts[1], parts[2], message_id, user_id)
         except Exception as exc: admin_render(chat_id, "بازنویسی ناموفق بود؛ نسخه قبلی حفظ شد. " + sanitize_error_text(exc),
                                              [[admin_button("درخواست بازنویسی با Groq", f"afallbackrewrite|{parts[1]}|{parts[2]}|groq|{parts[3]}"), admin_button("درخواست بازنویسی با Mistral", f"afallbackrewrite|{parts[1]}|{parts[2]}|mistral|{parts[3]}")],
@@ -6608,8 +7057,21 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
         analytics_v55.ensure_state(state)["settings"]["paused"] = False; analytics_save(state); analytics_menu(state, chat_id, message_id)
     elif action == "asettings":
         a = analytics_v55.ensure_state(state); st = a["settings"]
-        admin_render(chat_id, f"⚙️ تنظیمات تحلیلی\nمنطقه زمانی: {st.get('timezone')}\nحالت زمان‌بندی: {st.get('schedule_mode')}\nالزام تصویر پیش‌فرض: {st.get('require_image')}\nبازه: {st.get('start_hour')}:00 تا {st.get('end_hour')}:00\nفاصله از خبر: {st.get('min_news_gap_minutes')} دقیقه\nپروژه در روز: {st.get('daily_project_limit',1)}\nپیش‌فرض تعداد پست: {st.get('default_post_count',6)}\nمدل تحقیق اصلی: Gemini؛ جایگزین‌ها فقط با درخواست صریح مدیر.",
-                     [[admin_button("تغییر منطقه زمانی", "atimezone")], [admin_button("تغییر بازه انتشار", "aslot")], [admin_button("تغییر حالت خودکار/دستی", "amode")], [admin_button("تغییر الزام تصویر", "aimagereq")], [admin_button("توقف/ادامه صف", "apaus" if not st.get("paused") else "aresume")], [admin_button("بازگشت", "analytics")]], message_id)
+        queue_count = sum(1 for x in a.get("ai_queue", []) if isinstance(x, dict) and x.get("status") == "queued")
+        admin_render(chat_id, f"⚙️ تنظیمات تحلیلی\nمنطقه زمانی: {st.get('timezone')}\nحالت زمان‌بندی: {st.get('schedule_mode')}\nالزام تصویر پیش‌فرض: {st.get('require_image')}\nبازه: {st.get('start_hour')}:00 تا {st.get('end_hour')}:00\nفاصله از خبر: {st.get('min_news_gap_minutes')} دقیقه\nپروژه در روز: {st.get('daily_project_limit',1)}\nپیش‌فرض تعداد پست: {st.get('default_post_count',6)}\nFailover خودکار: {'روشن' if st.get('auto_failover') else 'خاموش'}\nصف انتظار AI: {'روشن' if st.get('queue_when_ai_unavailable') else 'خاموش'} | پروژه‌های منتظر: {queue_count}",
+                     [[admin_button("🔀 فعال/غیرفعال Failover خودکار", "aifailover")], [admin_button("📥 صف پروژه هنگام نبود AI", "aiqueue")], [admin_button("تغییر منطقه زمانی", "atimezone")], [admin_button("تغییر بازه انتشار", "aslot")], [admin_button("تغییر حالت خودکار/دستی", "amode")], [admin_button("تغییر الزام تصویر", "aimagereq")], [admin_button("توقف/ادامه صف انتشار تحلیلی", "apaus" if not st.get("paused") else "aresume")], [admin_button("بازگشت", "analytics")]], message_id)
+    elif action == "aifailover":
+        st = analytics_v55.ensure_state(state)["settings"]
+        st["auto_failover"] = not bool(st.get("auto_failover", False))
+        analytics_save(state)
+        record_admin_activity(state, user_id, "تغییر Failover تحلیلی", str(st["auto_failover"]))
+        admin_render(chat_id, "Failover خودکار محتوای تحلیلی: " + ("روشن" if st["auto_failover"] else "خاموش"), [[admin_button("تنظیمات تحلیلی", "asettings")]], message_id)
+    elif action == "aiqueue":
+        st = analytics_v55.ensure_state(state)["settings"]
+        st["queue_when_ai_unavailable"] = not bool(st.get("queue_when_ai_unavailable", False))
+        analytics_save(state)
+        record_admin_activity(state, user_id, "تغییر صف انتظار AI تحلیلی", str(st["queue_when_ai_unavailable"]))
+        admin_render(chat_id, "صف انتظار پروژه هنگام نبود هوش مصنوعی: " + ("روشن" if st["queue_when_ai_unavailable"] else "خاموش"), [[admin_button("تنظیمات تحلیلی", "asettings")]], message_id)
     elif action == "atimezone":
         ask_admin_input(state, user_id, chat_id, {"type": "analytics_timezone_input"}, "نام منطقه زمانی معتبر IANA را بفرست؛ مثال: Asia/Tehran یا Europe/Berlin.", message_id)
     elif action == "aslot":
@@ -6628,8 +7090,13 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
             admin_render(chat_id, f"برای {len(p.get('posts',[]))} پست، تاریخ و ساعت محلی را به ترتیب با قالب YYYY-MM-DD HH:MM وارد کن و با ویرگول جدا کن. فاصله از خبرها/تحلیل‌ها، ترتیب و قانون یک پروژه در روز بررسی می‌شود. /cancel برای لغو.", [[admin_button("بازگشت به پروژه", "aopen|" + parts[1])]], message_id)
     elif action == "abulktoggle":
         admin_render(chat_id, "این دکمه باید از صفحه پست اجرا شود.", [[admin_button("عملیات گروهی", "abulk")]], message_id)
+    elif action == "pausesettings":
+        render_pause_settings(state, chat_id, message_id)
+    elif action == "modesettings":
+        render_modes_settings(state, chat_id, message_id)
     elif action == "v53":
-        render_v53_menu(state, chat_id, message_id)
+        # Legacy callback compatibility: V5.3 controls have been redistributed.
+        admin_show_menu(chat_id, message_id, role)
     elif action == "pause" and len(parts) > 1:
         pause_mode = parts[1]
         if pause_mode == "1h":
@@ -6641,25 +7108,37 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
         elif pause_mode == "important":
             state["_paused_until"] = 0; state["_pause_until_important"] = True
         save_state(state); record_admin_activity(state, user_id, "توقف زمان‌دار", pause_mode)
-        render_v53_menu(state, chat_id, message_id)
+        render_pause_settings(state, chat_id, message_id)
     elif action == "resume":
         state["_paused_until"] = 0; state["_pause_until_important"] = False
-        save_state(state); record_admin_activity(state, user_id, "ادامه انتشار", "پنل V5.3")
-        render_v53_menu(state, chat_id, message_id)
+        save_state(state); record_admin_activity(state, user_id, "ادامه انتشار", "تنظیمات توقف")
+        render_pause_settings(state, chat_id, message_id)
     elif action == "profile" and len(parts) > 1:
         profile = parts[1]
         st = admin_settings(state)
         if profile == "war":
-            st.update({"active_start_hour": 0, "afternoon_start_hour": 14, "active_end_hour": 24,
-                       "morning_spacing_minutes": 20, "afternoon_spacing_minutes": 20})
+            if state.get("_profile") != "war":
+                st["normal_profile_snapshot"] = {
+                    key: st.get(key) for key in (
+                        "active_start_hour", "afternoon_start_hour", "active_end_hour",
+                        "morning_spacing_minutes", "afternoon_spacing_minutes",
+                    )
+                }
+            st.update({"active_start_hour": 0, "afternoon_start_hour": 0, "active_end_hour": 24,
+                       "morning_spacing_minutes": 0, "afternoon_spacing_minutes": 0})
             state["_profile"] = "war"
         else:
-            st.update({"active_start_hour": 8, "afternoon_start_hour": 14, "active_end_hour": 24,
-                       "morning_spacing_minutes": MORNING_POST_SPACING_MINUTES,
-                       "afternoon_spacing_minutes": AFTERNOON_POST_SPACING_MINUTES})
+            snapshot = st.get("normal_profile_snapshot") or {}
+            st.update({
+                "active_start_hour": safe_int(snapshot.get("active_start_hour", 8), 8),
+                "afternoon_start_hour": safe_int(snapshot.get("afternoon_start_hour", 14), 14),
+                "active_end_hour": safe_int(snapshot.get("active_end_hour", 24), 24),
+                "morning_spacing_minutes": safe_int(snapshot.get("morning_spacing_minutes", MORNING_POST_SPACING_MINUTES), MORNING_POST_SPACING_MINUTES),
+                "afternoon_spacing_minutes": safe_int(snapshot.get("afternoon_spacing_minutes", AFTERNOON_POST_SPACING_MINUTES), AFTERNOON_POST_SPACING_MINUTES),
+            })
             state["_profile"] = "normal"
         save_state(state); record_admin_activity(state, user_id, "تغییر پروفایل", profile)
-        render_v53_menu(state, chat_id, message_id)
+        render_modes_settings(state, chat_id, message_id)
     elif action == "blockadd":
         ask_admin_input(state, user_id, chat_id, {"type": "block_term"}, "واژه/عبارت ممنوع را بفرست؛ پست خام دارای این عبارت پیش از AI رد می‌شود.", message_id)
     elif action == "keyadd":
@@ -6739,7 +7218,7 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
         ask_admin_input(state, user_id, chat_id, {"type": "history_search"}, "عبارت جست‌وجو را بفرست. جست‌وجو در تیتر، متن، نام منبع، bucket و شناسه پیام انجام می‌شود.", message_id)
     elif action == "exportcsv":
         send_history_csv(state, chat_id)
-        admin_render(chat_id, "✅ فایل CSV تاریخچه آماده شد.", [[admin_button("بازگشت به V5.3", "v53")]], message_id)
+        admin_render(chat_id, "✅ فایل CSV تاریخچه آماده شد.", [[admin_button("بازگشت به آمار و وضعیت ربات", "stats")]], message_id)
     elif action == "find" and len(parts) > 1:
         render_find_message(state, chat_id, parts[1], message_id)
     elif action == "qexact" and len(parts) > 1:
@@ -6812,9 +7291,29 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
             "ai_attempts": "تعداد تلاش برای هر سرویس را بفرست: ۱ یا ۲.",
         }
         ask_admin_input(state, user_id, chat_id, {"type": "setting_value", "key": key}, prompts.get(key, "مقدار جدید را بفرست."), message_id)
+    elif action == "rejectednews":
+        render_rejected_news(state, chat_id, message_id)
+    elif action == "rejectedpage":
+        render_rejected_news(state, chat_id, message_id, safe_int(parts[1] if len(parts) > 1 else 0, 0))
+    elif action == "rj" and len(parts) > 1:
+        render_rejected_news_item(state, chat_id, parts[1], message_id)
+    elif action == "rrestore" and len(parts) > 1:
+        try:
+            restored = restore_rejected_news(state, parts[1], user_id)
+            admin_render(chat_id, "✅ خبر با تأیید دستی به صف انتشار برگشت.\n\n" + restored.get("title", ""),
+                         [[admin_button("مشاهده در صف", "q|" + restored["admin_id"])],
+                          [admin_button("صف انتشار", "queue")], [admin_button("خبرهای ردشده", "rejectednews")]], message_id)
+        except Exception as exc:
+            admin_render(chat_id, "بازگرداندن خبر انجام نشد: " + sanitize_error_text(exc), [[admin_button("بازگشت به خبر ردشده", "rj|" + parts[1])]], message_id)
     elif action == "news":
-        rows = [[admin_button("📥 صف انتشار", "queue")], [admin_button("🗃 تاریخچه منتشرشده", "history")], [admin_button("🧾 دلایل انتخاب/رد", "decisions")], [admin_button("⬅️ منوی اصلی", "menu")]]
-        admin_render(chat_id, "📰 مدیریت اخبار", rows, message_id)
+        rows = [
+            [admin_button("📥 صف انتشار", "queue"), admin_button("🧾 خبرهای ردشده", "rejectednews")],
+            [admin_button("🗃 تاریخچه منتشرشده", "history")],
+            [admin_button("🔎 جست‌وجوی تاریخچه", "historysearch")],
+            [admin_button("🧠 دلایل انتخاب و رد", "decisions")],
+            [admin_button("⬅️ منوی اصلی", "menu")],
+        ]
+        admin_render(chat_id, "📰 مدیریت اخبار\n\nخبرهای ردشده را می‌توانی بررسی و در صورت لزوم با تأیید دستی به صف انتشار برگردانی.", rows, message_id)
     elif action == "queue": render_queue(state, chat_id, message_id)
     elif action == "queuepage": render_queue(state, chat_id, message_id, safe_int(parts[1] if len(parts) > 1 else 0, 0))
     elif action == "q" and len(parts) > 1: render_queue_item(state, chat_id, parts[1], message_id)
@@ -6964,7 +7463,7 @@ def extract_analytics_document_text(document):
             reader = PdfReader(io.BytesIO(data))
             extracted = "\n\n".join((page.extract_text() or "") for page in reader.pages[:300])
         except ImportError as exc:
-            raise RuntimeError("برای استخراج PDF، بسته pypdf نصب نیست؛ requirements.txt نسخه V5.6 را نصب کن.") from exc
+            raise RuntimeError("برای استخراج PDF، بسته pypdf نصب نیست؛ requirements.txt نسخه V5.7 را نصب کن.") from exc
         except Exception as exc:
             raise RuntimeError("استخراج متن PDF انجام نشد؛ احتمال دارد PDF اسکن‌شده و فاقد متن قابل‌استخراج باشد.") from exc
     else:
@@ -6977,7 +7476,7 @@ def extract_analytics_document_text(document):
                     parts.append(" | ".join(cell.text.strip() for cell in row.cells))
             extracted = "\n".join(parts)
         except ImportError as exc:
-            raise RuntimeError("برای استخراج DOCX، بسته python-docx نصب نیست؛ requirements.txt نسخه V5.6 را نصب کن.") from exc
+            raise RuntimeError("برای استخراج DOCX، بسته python-docx نصب نیست؛ requirements.txt نسخه V5.7 را نصب کن.") from exc
     extracted = str(extracted or "").strip()
     if not extracted:
         raise ValueError("از فایل متن قابل‌استخراج پیدا نشد؛ برای PDF اسکن‌شده، OCR در این نسخه فعال نیست.")
@@ -7054,12 +7553,19 @@ def _handle_admin_update_unlocked(state, update):
             project["title"] = (str(document.get("file_name", "پروژه از فایل"))[:95] or project["title"])
             project["status"] = "converting"; analytics_save(state)
             try:
+                analytics_apply_ai_runtime(state, project)
                 analytics_v55.split_into_posts(project)
                 analytics_v55.attach_images(project)
+                project.pop("_ai_runtime", None)
                 analytics_save(state); clear_admin_session(state, user_id)
                 analytics_open(state, chat_id, project["id"])
             except Exception as exc:
+                if analytics_try_queue_unavailable(state, project, "split", exc, user_id):
+                    clear_admin_session(state, user_id)
+                    admin_render(chat_id, "📥 فایل دریافت و متن آن استخراج شد؛ پروژه در صف انتظار AI قرار گرفت و به‌صورت خودکار ادامه پیدا می‌کند.", [[admin_button("مشاهده پروژه", "aopen|" + project["id"])], [admin_button("پروژه‌ها", "alist|all")]])
+                    return
                 project["status"] = "error"; project["last_error"] = sanitize_error_text(exc)
+                project.pop("_ai_runtime", None)
                 project.setdefault("errors", []).append({"at": now_ts(), "error": project["last_error"]})
                 analytics_save(state); clear_admin_session(state, user_id)
                 admin_render(chat_id, "فایل دریافت و متن استخراج شد، اما تولید پست ناموفق بود؛ پروژه و متن ذخیره شده‌اند.\n" + project["last_error"],
@@ -7116,7 +7622,20 @@ def _handle_admin_update_unlocked(state, update):
 
 
 def handle_admin_update(state, update):
-    # Panel operations update the same queue/settings/history as the publishing loop.
+    # Fast-path /admin: the news AI pipeline can hold STATE_LOCK during a long
+    # provider request. Opening the menu is read-mostly and should stay responsive.
+    message = update.get("message") if isinstance(update, dict) else None
+    if isinstance(message, dict) and str(message.get("text", "")).strip().split(" ", 1)[0] == "/admin":
+        sender = message.get("from", {})
+        chat = message.get("chat", {})
+        user_id = safe_int(sender.get("id"), 0)
+        chat_id = chat.get("id")
+        role = admin_role(state, user_id)
+        if user_id and chat_id is not None and role:
+            clear_admin_session(state, user_id)
+            admin_show_menu(chat_id, role=role)
+            return
+    # Other state-changing panel operations remain serialized.
     with STATE_LOCK:
         return _handle_admin_update_unlocked(state, update)
 
@@ -7330,34 +7849,21 @@ def render_auto_rules(state, chat_id, message_id=None):
         lines.append(f"• {'فعال' if rule.get('enabled', True) else 'غیرفعال'} — {desc}")
         rows.append([admin_button(("🟢 " if rule.get('enabled', True) else "⚪ ") + desc[:38], f"ruletoggle|{rule.get('id')}") , admin_button("حذف", f"ruledelete|{rule.get('id')}")])
     if not rules: lines.append("هنوز قانونی ثبت نشده است.")
-    rows.extend([[admin_button("➕ افزودن قانون", "ruleadd")], [admin_button("🔁 روشن/خاموش‌کردن گیت قوانین", "rulesgate")], [admin_button("⬅️ V5.3", "v53")]])
+    rows.extend([[admin_button("➕ افزودن قانون", "ruleadd")], [admin_button("🔁 روشن/خاموش‌کردن گیت قوانین", "rulesgate")], [admin_button("⬅️ بازگشت به تنظیمات", "settings")]])
     lines.append("\nدر هر گروه، شرط‌ها با AND ارزیابی می‌شوند؛ گروه‌های جداشده با OR کافی است یکی تطبیق داشته باشد. چند قانون مستقل نیز مثل OR عمل می‌کنند. برای نمونه: score>=85;source=ChannelA OR score>=95;bucket=iran. برای الزام تأیید دستی خبرهای بدون قانون منطبق، گیت قوانین را روشن کن؛ حالت پیش‌فرض برای سازگاری با V5 خاموش است.")
     admin_render(chat_id, "\n".join(lines), rows, message_id)
 
 
 def render_v53_menu(state, chat_id, message_id=None):
-    paused_until = safe_float(state.get("_paused_until", 0), 0)
-    if paused_until > now_ts():
-        pause_text = datetime.fromtimestamp(paused_until, TEHRAN_TZ or timezone.utc).strftime("%Y-%m-%d %H:%M")
-    elif state.get("_pause_until_important"):
-        pause_text = "تا ورود خبر مهم/فوری"
-    else:
-        pause_text = "فعال؛ بدون توقف زمان‌دار"
-    profile = "حالت جنگ" if state.get("_profile") == "war" else "حالت عادی"
+    """Backward-compatible landing page for old inline buttons; controls now live in their proper sections."""
     rows = [
-        [admin_button("📈 تحلیل عملکرد", "metrics"), admin_button("📡 آمار منابع", "sourcestats")],
-        [admin_button("🔎 جست‌وجوی تاریخچه", "historysearch"), admin_button("📄 خروجی CSV", "exportcsv")],
-        [admin_button("🚫 واژه‌ها و سکوت موضوعی", "terms")],
-        [admin_button("✅ قوانین تأیید خودکار", "rules")],
-        [admin_button("➕ افزودن بلاک‌لیست", "blockadd"), admin_button("⭐ کلیدواژه اولویت", "keyadd")],
-        [admin_button("🔕 سکوت موضوعی موقت", "silenceadd")],
-        [admin_button("⏸ توقف ۱ ساعت", "pause|1h"), admin_button("⏸ تا فردا ۷ صبح", "pause|tomorrow")],
-        [admin_button("⏸ تا خبر مهم", "pause|important"), admin_button("▶️ ادامه", "resume")],
-        [admin_button("⚔️ حالت جنگ", "profile|war"), admin_button("🕊 حالت عادی", "profile|normal")],
-        [admin_button("📥 صف انتشار", "queue"), admin_button("📡 منابع", "sources")],
-        [admin_button("⬅️ منوی اصلی", "menu")],
+        [admin_button("📈 تحلیل عملکرد و CSV", "stats")],
+        [admin_button("📡 آمار منابع", "sourcestats")],
+        [admin_button("✅ قوانین و واژه‌ها", "settings")],
+        [admin_button("⏸ توقف و حالت‌ها", "pausesettings")],
+        [admin_button("🏠 منوی اصلی", "menu")],
     ]
-    admin_render(chat_id, f"🧰 قابلیت‌های Raptor V{BOT_VERSION}\n\nپروفایل: {profile}\nوضعیت توقف: {pause_text}\nبلاک‌لیست: {len(state.get('_blocklist_terms', []))} عبارت\nکلیدواژه‌های اولویت: {len(state.get('_priority_keywords', []))}\nسکوت‌های فعال: {sum(1 for x in state.get('_topic_silences', []) if safe_float(x.get('until_ts'), 0) > now_ts())}\n\nتوجه: پروفایل‌ها فقط تنظیمات انتشار اخبار موجود را تغییر می‌دهند؛ سیستم خبر مستقل باقی می‌ماند.", rows, message_id)
+    admin_render(chat_id, "قابلیت‌های نسخه قبلی به بخش‌های مرتبط منتقل شده‌اند.\nصف انتشار و مدیریت منابع فقط در منوهای اصلی خودشان قرار دارند.", rows, message_id)
 
 
 def render_terms(state, chat_id, message_id=None):
@@ -7369,15 +7875,11 @@ def render_terms(state, chat_id, message_id=None):
     lines.extend([f"• {x}" for x in blocked] or ["• خالی"])
     lines.append("\nکلیدواژه‌های اولویت:")
     lines.extend([f"• {x}" for x in priority] or ["• خالی"])
-    lines.append("\nسکوت‌های فعال:")
-    for entry in silences[-10:]:
-        until = datetime.fromtimestamp(safe_float(entry.get("until_ts"), 0), TEHRAN_TZ or timezone.utc).strftime("%m-%d %H:%M")
-        lines.append(f"• {entry.get('term')} تا {until}")
+    # Temporary topic silences are managed in the dedicated Pause Settings page.
     rows = [
         [admin_button("➕ افزودن عبارت ممنوع", "blockadd")],
         [admin_button("➕ افزودن کلیدواژه اولویت", "keyadd")],
-        [admin_button("🔕 افزودن سکوت موضوعی", "silenceadd")],
-        [admin_button("⬅️ V5.3", "v53")],
+        [admin_button("⬅️ بازگشت به تنظیمات", "settings")],
     ]
     admin_render(chat_id, "\n".join(lines), rows, message_id)
 
@@ -7392,7 +7894,7 @@ def render_source_stats(state, chat_id, message_id=None):
         h = health.get(source, {})
         disabled = source in set(state.get("_disabled_sources", []))
         lines.append(f"@{source} {'[غیرفعال]' if disabled else ''}\n  دریافت‌شده: {safe_int(st.get('fetched'),0)} | جدید: {safe_int(st.get('new'),0)}\n  منتشرشده: {safe_int(st.get('published'),0)} | ردشده: {safe_int(st.get('rejected'),0)} | خطا: {safe_int(st.get('errors'),0)}\n  شکست متوالی: {safe_int(h.get('fail_count'),0)}")
-    admin_render(chat_id, "\n\n".join(lines), [[admin_button("🔄 تازه‌سازی", "sourcestats")], [admin_button("مدیریت منابع", "sources")], [admin_button("V5.3", "v53")]], message_id)
+    admin_render(chat_id, "\n\n".join(lines), [[admin_button("🔄 تازه‌سازی", "sourcestats")], [admin_button("مدیریت منابع", "sources")], [admin_button("منوی اصلی", "menu")]], message_id)
 
 
 def _try_tgstat_views(record):
@@ -7461,7 +7963,7 @@ def render_performance(state, chat_id, message_id=None):
     if CHEAP_CLASSIFIER_ENABLED:
         lines.append(f"\nپیش‌فیلتر ارزان: دیده {safe_int(classifier.get('seen'),0)} | عبور {safe_int(classifier.get('passed'),0)} | رد {safe_int(classifier.get('rejected'),0)} | خطا {safe_int(classifier.get('errors'),0)}")
         lines.append("صرفه‌جویی ۶۰–۸۰٪ فرض نشده؛ اثر واقعی باید از داده مصرف/کیفیت سنجیده شود.")
-    admin_render(chat_id, "\n".join(lines), [[admin_button("🔄 تازه‌سازی", "metrics")], [admin_button("📄 خروجی CSV", "exportcsv")], [admin_button("V5.3", "v53")]], message_id)
+    admin_render(chat_id, "\n".join(lines), [[admin_button("🔄 تازه‌سازی", "metrics")], [admin_button("📄 خروجی CSV", "exportcsv")], [admin_button("بازگشت به آمار", "stats")]], message_id)
 
 
 def render_history_search_results(state, chat_id, query, matches):
@@ -7472,7 +7974,7 @@ def render_history_search_results(state, chat_id, query, matches):
         if rec.get("history_id"):
             rows.append([admin_button(str(rec.get("title", "پست"))[:42], f"h|{rec['history_id']}")])
     if not matches: lines.append("موردی پیدا نشد.")
-    rows.extend([[admin_button("جست‌وجوی دوباره", "historysearch")], [admin_button("خروجی CSV", "exportcsv")], [admin_button("V5.3", "v53")]])
+    rows.extend([[admin_button("جست‌وجوی دوباره", "historysearch")], [admin_button("خروجی CSV", "exportcsv")], [admin_button("آمار و وضعیت ربات", "stats")]])
     admin_render(chat_id, "\n".join(lines), rows)
 
 
@@ -7486,7 +7988,7 @@ def render_find_message(state, chat_id, message_id, edit_message_id=None):
             text = (f"🔍 رکورد پیام {target}\n\nعنوان: {rec.get('title','')}\nزمان: {stamp}\nمنابع: {', '.join(rec.get('source_channels', [])) or 'نامشخص'}\nهوش مصنوعی: {rec.get('ai_provider','unknown')}\nامتیاز: {rec.get('news_score','—')}\nسبد: {rec.get('content_bucket','—')}\n\n{rec.get('body','')}")
             admin_render(chat_id, text, [[admin_button("بازکردن رکورد", f"h|{rec.get('history_id')}")], [admin_button("تاریخچه", "history")]], edit_message_id)
             return
-    admin_render(chat_id, f"پیام {target} در تاریخچه موجود پیدا نشد. توجه: فقط پیام‌های ثبت‌شده در state قابل جست‌وجو هستند.", [[admin_button("تاریخچه", "history")], [admin_button("V5.3", "v53")]], edit_message_id)
+    admin_render(chat_id, f"پیام {target} در تاریخچه موجود پیدا نشد. توجه: فقط پیام‌های ثبت‌شده در state قابل جست‌وجو هستند.", [[admin_button("تاریخچه", "history")], [admin_button("منوی اصلی", "menu")]], edit_message_id)
 
 
 def send_history_csv(state, chat_id):
@@ -7517,16 +8019,7 @@ def send_owner_notice(state, alert_key, text, cooldown_seconds=4*3600):
 
 
 def check_v53_alerts(state):
-    enabled = runtime_provider_order(state)
-    unhealthy = []
-    for provider in enabled:
-        configured = bool(AI_PROVIDER_KEYS.get(provider))
-        ps = provider_state(state, provider)
-        cooling = safe_float(ps.get("cooldown_until"), 0) > now_ts()
-        if not configured or cooling:
-            unhealthy.append(provider)
-    if enabled and len(unhealthy) == len(enabled):
-        send_owner_notice(state, "all_ai_down", "همه ارائه‌دهنده‌های AI فعال فاقد کلید یا در دوره انتظار/خطا هستند. بخش AI را بررسی کن.", 3600)
+    # Provider-key exhaustion/inactive-key notices are deliberately disabled.
     for source, health in state.get("_source_health", {}).items():
         if safe_int(health.get("fail_count"), 0) >= 3:
             send_owner_notice(state, f"source:{source}", f"منبع @{source} دست‌کم سه بار متوالی شکست خورده است. آخرین خطا: {health.get('last_error','نامشخص')}", 4*3600)
@@ -7661,7 +8154,7 @@ def main():
             with STATE_LOCK:
                 analytics_process_due(state)
         except Exception as analytics_exc:
-            log.exception("چرخه انتشار تحلیلی V5.6 با خطا متوقف شد: %s", sanitize_error_text(analytics_exc))
+            log.exception("چرخه انتشار تحلیلی V5.7 با خطا متوقف شد: %s", sanitize_error_text(analytics_exc))
             with STATE_LOCK:
                 a = analytics_v55.ensure_state(state)
                 a.setdefault("runtime_errors", []).append({"at": now_ts(), "error": sanitize_error_text(analytics_exc)[:400]})
@@ -7669,6 +8162,8 @@ def main():
                 save_state(state)
         elapsed = now_ts() - started
         sleep_for = max(5, POLL_INTERVAL_SECONDS - int(elapsed))
+        if state.get("_profile") == "war" and state.get("_pending_queue"):
+            sleep_for = min(sleep_for, 5)
         time.sleep(sleep_for)
 
 
