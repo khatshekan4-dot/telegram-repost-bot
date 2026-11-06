@@ -13,6 +13,7 @@ import io
 import copy
 import uuid
 import analytics as analytics_v55
+import reliability as reliability_v58
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -276,7 +277,7 @@ except ValueError:
 STATE_IO_LOCK = threading.RLock()
 # قفل مشترک برای تراکنش‌های منطقی state؛ قفل نوشتن فایل به‌تنهایی کافی نیست.
 STATE_LOCK = threading.RLock()
-BOT_VERSION = "5.7"
+BOT_VERSION = "5.8"
 CHEAP_CLASSIFIER_ENABLED = os.environ.get("CHEAP_CLASSIFIER_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 CHEAP_CLASSIFIER_MODEL = os.environ.get("CHEAP_CLASSIFIER_MODEL", "openai/gpt-oss-20b").strip()
 TGSTAT_API_TOKEN = os.environ.get("TGSTAT_API_TOKEN", "").strip()
@@ -786,7 +787,7 @@ def event_key_or_signature(title, body, event_key=""):
 
 def default_state():
     return {
-        "version": 5.7,
+        "version": 5.8,
         "_source_initialized": {},
         "_recent_titles": [],
         "_recent_events": [],
@@ -961,7 +962,7 @@ def load_state():
         for channel in settings.get("source_channels", SOURCE_CHANNELS):
             base["_source_stats"].setdefault(str(channel), {"fetched": 0, "new": 0, "published": 0, "rejected": 0, "errors": 0})
             base["_source_health"].setdefault(str(channel), {"fail_count": 0, "last_ok_ts": 0, "last_error_ts": 0, "last_error": ""})
-        base["version"] = 5.7
+        base["version"] = 5.8
         return base
     except Exception as exc:
         # Never overwrite a corrupt state file with a fresh empty state: preserve evidence and stop startup.
@@ -1313,6 +1314,21 @@ def calculate_priority(item):
     if region == "world" and not is_military_event(text, event_type):
         score -= 1
 
+    # Persist an explainable multi-factor breakdown (bounded 0..100 values).
+    # These are heuristic proxies based on already-classified metadata; they do
+    # not claim independent fact verification.
+    operational = 80 if is_military_event(text, event_type) else 35
+    balance = 70 if region in {"iran", "middle_east", "superpower"} else 40
+    novelty = min(100, max(0, safe_int(item.get("novelty_score", item.get("priority_hint", 50)), 50)))
+    audience_value = min(100, max(0, safe_int(item.get("news_score", 50), 50)))
+    confidence = min(100, max(0, safe_int(item.get("confidence_score", 60), 60)))
+    item["score_breakdown"] = {
+        "operational_importance": operational,
+        "balance_of_power_impact": balance,
+        "novelty": novelty,
+        "audience_value": audience_value,
+        "confidence": confidence,
+    }
     return score, region
 
 
@@ -3376,6 +3392,10 @@ def enqueue_item(state, item, force=False):
     item.setdefault("urgent", False)
     item.setdefault("delivery_status", "queued")
     item.setdefault("manual_priority", 0)
+    reliability_v58.ensure_lifecycle(item)
+    # Event-level grouping is separate from text fingerprint deduplication.
+    item.setdefault("event_update_type", "initial")
+    item.setdefault("event_update_count", 0)
     item.setdefault("region", "world")
     item.setdefault("entities", [])
     item["fingerprint"] = item_fingerprint(item)
@@ -3577,6 +3597,7 @@ def _process_queue_unlocked(state):
     queue_item = next((x for x in queue if str(x.get("admin_id", "")) == str(item.get("admin_id", ""))), None)
     if queue_item is not None:
         queue_item["delivery_status"] = "sending"
+        reliability_v58.transition(queue_item, "PUBLISHING", reason="ارسال به Telegram آغاز شد")
         queue_item["delivery_started_ts"] = now_ts()
         queue_item["delivery_attempts"] = safe_int(queue_item.get("delivery_attempts", 0), 0) + 1
         queue_item["_delivery_message_ids"] = []
@@ -3626,6 +3647,7 @@ def _process_queue_unlocked(state):
         save_state(state)
         return
 
+    reliability_v58.transition(item, "PUBLISHED", reason="ارسال Telegram موفق بود")
     queue.pop(index)
     state["_pending_queue"] = queue
     if str(state.get("_priority_pin_id", "")) == str(item.get("admin_id", "")):
@@ -5011,6 +5033,13 @@ def render_tools(state, chat_id, message_id=None):
 
 def diagnose_system(state):
     results = []
+    snapshot = reliability_v58.health_snapshot(state)
+    results.append("🧭 سلامت فرایند: " + json.dumps(snapshot, ensure_ascii=False))
+    if snapshot.get("queue_stale_over_30m", 0):
+        results.append(f"⚠️ صف: {snapshot['queue_stale_over_30m']} مورد بیش از ۳۰ دقیقه معطل است؛ بررسی مدیر لازم است.")
+    source_ts = snapshot.get("last_source_check_ts", 0)
+    if source_ts and now_ts() - source_ts > max(900, POLL_INTERVAL_SECONDS * 4):
+        results.append("⚠️ دریافت منابع: چرخه دریافت منابع قدیمی است؛ Worker یا چرخه اصلی را بررسی کن.")
     try:
         path = os.path.abspath(STATE_FILE)
         parent = os.path.dirname(path) or "."
@@ -5222,6 +5251,7 @@ def publish_queue_item_manually(state, item_id):
         return False, "حالت آزمایشی روشن است؛ هیچ پستی در کانال منتشر نشد و خبر در صف ماند."
     # انتشار فوری مدیر یک اقدام صریح است؛ نتیجه هر تلاش پیش از تماس با Telegram ذخیره می‌شود.
     item["delivery_status"] = "sending"
+    reliability_v58.transition(item, "PUBLISHING", reason="انتشار دستی توسط مدیر آغاز شد")
     item["delivery_started_ts"] = now_ts()
     item["delivery_attempts"] = safe_int(item.get("delivery_attempts", 0), 0) + 1
     item["manual_approval_required"] = False
@@ -5245,6 +5275,7 @@ def publish_queue_item_manually(state, item_id):
         state["_priority_pin_id"] = ""
     mark_posted_region(state, item)
     remember_item(state, item)
+    reliability_v58.transition(item, "PUBLISHED", reason="انتشار دستی موفق بود")
     record_published_item(state, item, result, manual=True)
     state["_last_queue_release_ts"] = now_ts()
     save_state(state)
@@ -8143,6 +8174,11 @@ def main():
         started = now_ts()
         try:
             process_once(state)
+            with STATE_LOCK:
+                state.setdefault("_runtime", {})["last_cycle_ok_ts"] = now_ts()
+                state.setdefault("_runtime", {})["last_cycle_error"] = ""
+                state.setdefault("_runtime", {})["last_health_snapshot"] = reliability_v58.health_snapshot(state)
+                save_state(state)
         except Exception as exc:
             with STATE_LOCK:
                 state.setdefault("_runtime", {})["last_cycle_error"] = sanitize_error_text(exc)

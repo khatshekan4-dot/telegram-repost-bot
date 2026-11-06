@@ -174,3 +174,20 @@ worker: python bot.py
 ### نکتهٔ استقرار
 
 این بسته به Railway، توکن تلگرام یا APIهای واقعی متصل نشده است. پیش از استقرار روی سرویس اصلی، یک نسخهٔ آزمایشی با Volume جدا و `TEST_MODE=true` اجرا کن. برای polling تلگرام فقط یک Worker/Replica فعال باشد. اگر لاگ‌ها متوقف شدند یا `/admin` جواب نداد، Metrics، وضعیت Deployment و لاگ‌های جدید را جداگانه بررسی کن.
+
+## V5.8 reliability and event lifecycle upgrade
+
+V5.8 adds `reliability.py`, a persistence-friendly helper module integrated into `bot.py`:
+
+- Stable `event_id` based on the existing normalized event key, distinct from the text fingerprint used for exact/near-duplicate checks.
+- Queue lifecycle metadata (`DISCOVERED`, `SCORED`, `APPROVED`, `SCHEDULED`, `PUBLISHING`, `PUBLISHED`, plus `RETRY`, `REJECTED`, `QUARANTINED`, `CANCELLED`) and bounded lifecycle history.
+- Explainable heuristic score breakdown fields for operational importance, balance-of-power impact, novelty, audience value, and confidence. These fields are heuristic proxies, not fact verification.
+- Runtime health snapshot persisted after successful main cycles: process uptime, source-check/cycle timestamps, recent cycle error, last publish timestamp, queue stale counts, memory peak and PID.
+- Admin diagnostic output now includes the health snapshot and warnings for stale source-check or queued items.
+
+### Safety and deployment notes
+
+- `state.json` is backward-compatible: new fields are added lazily to existing queue records and state version is advanced to 5.8.
+- This helper intentionally does **not** automatically resend a stale `sending` item. Telegram delivery may have succeeded even if the worker lost the response; automatic retry can create duplicate posts. Such items should be resolved via the existing uncertain-delivery manager flow.
+- Automatic process restart is not initiated from inside the bot. Configure Railway restart policy as the process supervisor; an in-process self-restart can create polling conflicts or repeated crash loops. The health snapshot supports detection and diagnosis, but Railway metrics (CPU/RAM) still must be read from Railway's platform telemetry.
+- Queue lifecycle fields are metadata and do not replace the existing delivery status/fingerprint mechanism.
