@@ -277,7 +277,9 @@ except ValueError:
 STATE_IO_LOCK = threading.RLock()
 # قفل مشترک برای تراکنش‌های منطقی state؛ قفل نوشتن فایل به‌تنهایی کافی نیست.
 STATE_LOCK = threading.RLock()
-BOT_VERSION = "5.8"
+# Wake the main worker as soon as an analytical job enters the durable queue.
+ANALYTICS_WAKE_EVENT = threading.Event()
+BOT_VERSION = "5.9"
 CHEAP_CLASSIFIER_ENABLED = os.environ.get("CHEAP_CLASSIFIER_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 CHEAP_CLASSIFIER_MODEL = os.environ.get("CHEAP_CLASSIFIER_MODEL", "openai/gpt-oss-20b").strip()
 TGSTAT_API_TOKEN = os.environ.get("TGSTAT_API_TOKEN", "").strip()
@@ -290,7 +292,7 @@ MAX_ADMIN_LOGS = 100
 
 HTTP_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (compatible; RaptorNewsBot/5.7; "
+        "Mozilla/5.0 (compatible; RaptorNewsBot/5.9; "
         "+https://t.me/khaatshekaan)"
     )
 }
@@ -787,7 +789,7 @@ def event_key_or_signature(title, body, event_key=""):
 
 def default_state():
     return {
-        "version": 5.8,
+        "version": 5.9,
         "_source_initialized": {},
         "_recent_titles": [],
         "_recent_events": [],
@@ -869,6 +871,8 @@ def default_state():
         "_weekly_summary_last_week": "",
         "_v53_classifier": {"seen": 0, "passed": 0, "rejected": 0, "errors": 0},
         "_profile": "normal",
+        # Independent master switch for the news engine. Analytics keeps running.
+        "_news_engine_enabled": True,
     }
 
 
@@ -962,7 +966,7 @@ def load_state():
         for channel in settings.get("source_channels", SOURCE_CHANNELS):
             base["_source_stats"].setdefault(str(channel), {"fetched": 0, "new": 0, "published": 0, "rejected": 0, "errors": 0})
             base["_source_health"].setdefault(str(channel), {"fail_count": 0, "last_ok_ts": 0, "last_error_ts": 0, "last_error": ""})
-        base["version"] = 5.8
+        base["version"] = 5.9
         return base
     except Exception as exc:
         # Never overwrite a corrupt state file with a fresh empty state: preserve evidence and stop startup.
@@ -4070,8 +4074,15 @@ def process_once(state):
     7) صف و زمان‌بندی ثابت
     """
     all_new_posts = []
-    with STATE_LOCK:
+    if not bool(state.get("_news_engine_enabled", True)):
         runtime = state.setdefault("_runtime", {})
+        runtime["news_engine_paused"] = True
+        runtime.setdefault("news_engine_paused_at", now_ts())
+        return
+    runtime = state.setdefault("_runtime", {})
+    runtime["news_engine_paused"] = False
+    runtime.pop("news_engine_paused_at", None)
+    with STATE_LOCK:
         runtime["last_source_check_ts"] = now_ts()
         runtime["last_cycle_error"] = ""
         save_state(state)
@@ -4599,13 +4610,15 @@ def admin_show_menu(chat_id, message_id=None, role="observer"):
             [admin_button("📰 مدیریت اخبار", "news"), admin_button("📡 مدیریت منابع", "sources")],
             [admin_button("🤖 مدیریت هوش مصنوعی", "ai")],
         ]
+        news_enabled = bool(state.get("_news_engine_enabled", True))
         rows.extend([
             [admin_button("📚 محتوای تحلیلی", "analytics")],
+            [admin_button("⏸ خاموش‌کردن موتور اخبار" if news_enabled else "▶️ روشن‌کردن موتور اخبار", "newsengine")],
             [admin_button("📝 گزارش فعالیت‌ها", "logs"), admin_button("🛠 عیب‌یابی و ابزارها", "tools")],
         ])
     if role == "owner":
         rows.append([admin_button("👥 مدیریت ادمین‌ها", "admins")])
-    admin_render(chat_id, f"🦅 پنل مدیریت رپتور — نسخه {BOT_VERSION}\nیک بخش را انتخاب کن:", rows, message_id)
+    admin_render(chat_id, f"🦅 پنل مدیریت رپتور — نسخه {BOT_VERSION}\nموتور اخبار: {'فعال' if state.get('_news_engine_enabled', True) else 'متوقف'}\nیک بخش را انتخاب کن:", rows, message_id)
 
 
 def render_stats(state, chat_id, message_id=None):
@@ -5515,25 +5528,20 @@ def handle_admin_text(state, user_id, chat_id, text):
         elif mode == "analytics_file_input":
             raise ValueError("این مرحله منتظر فایل TXT، MD، PDF یا DOCX است؛ متن عادی را در گزینه «تبدیل متن» بفرست یا فایل را ضمیمه کن.")
         elif mode == "analytics_research_input":
-            project=analytics_v55.new_project(state,"research",text,user_id)
-            project["status"]="researching"; analytics_save(state)
-            admin_render(chat_id,"🔎 تحقیق اینترنتی و تحلیل Gemini آغاز شد. اگر جست‌وجو یا Gemini شکست بخورد، پروژه در وضعیت خطا می‌ماند و چیزی منتشر نمی‌شود.")
-            try:
-                analytics_apply_ai_runtime(state, project)
-                analytics_v55.research_project(project)
-                project.pop("_ai_runtime", None)
-                analytics_save(state); clear_admin_session(state,user_id)
-                admin_render(chat_id,f"تحقیق آماده بازبینی است.\nپروژه: {project['title']}\nنتایج جست‌وجو: {len(project.get('sources',[]))}\n\n{project.get('article','')[:2500]}",[[admin_button("📄 مشاهده مقاله کامل","aarticle|"+project["id"])],[admin_button("🔗 بررسی منابع","asources|"+project["id"])],[admin_button("✅ تأیید مقاله و ساخت پست‌ها","aresearchok|"+project["id"])],[admin_button("❌ رد تحقیق","areject|"+project["id"])],[admin_button("پروژه‌ها","alist")]])
-            except Exception as exc:
-                if analytics_try_queue_unavailable(state, project, "research", exc, user_id):
-                    clear_admin_session(state,user_id)
-                    admin_render(chat_id,"📥 پروژه تحقیقاتی در صف انتظار AI ثبت شد. به محض دسترس‌پذیری یکی از ارائه‌دهندگان فعال، تحقیق به‌صورت خودکار ادامه پیدا می‌کند؛ نیازی به ارسال دوباره موضوع نیست.", [[admin_button("مشاهده پروژه", "aopen|"+project["id"])],[admin_button("صف پروژه‌ها", "alist|all")]])
-                    return
-                project["status"]="error"; project["last_error"]=sanitize_error_text(exc); project.setdefault("errors",[]).append({"at":now_ts(),"error":project["last_error"]}); project.pop("_ai_runtime", None); analytics_save(state); clear_admin_session(state,user_id)
-                admin_render(chat_id,"❌ تحقیق متوقف شد؛ مقاله ناقص ساخته یا منتشر نشد.\n"+project["last_error"],
-                             [[admin_button("تلاش دوباره با Gemini", "aresearchretry|" + project["id"])],
-                              [admin_button("درخواست جایگزین Groq", "afallbackresearch|" + project["id"] + "|groq"), admin_button("درخواست جایگزین Mistral", "afallbackresearch|" + project["id"] + "|mistral")],
-                              [admin_button("پروژه‌ها","alist|all")],[admin_button("منوی تحلیلی","analytics")]])
+            project = analytics_v55.new_project(state, "research", text, user_id)
+            project["status"] = "queued_ai"
+            task = analytics_queue_task(state, project, "research", user_id,
+                                        "موضوع ثبت شد؛ در انتظار پردازش خودکار با یکی از موتورهای فعال.")
+            clear_admin_session(state, user_id)
+            admin_render(chat_id,
+                "📥 موضوع ثبت شد و در صف پایدار تحقیق قرار گرفت.\n"
+                "ربات به‌صورت خودکار با هرکدام از Gemini، Groq یا Mistral که فعال و در دسترس باشد کار می‌کند؛ "
+                "ابتدا وب را جست‌وجو می‌کند، مقاله تحلیلی می‌سازد، آن را به پیش‌نویس‌های مستقل تبدیل می‌کند و برای هر پست تصویر مرتبط پیدا می‌کند.\n"
+                "اگر جست‌وجو یا همه موتورهای هوش مصنوعی موقتاً قطع باشند، همین موضوع در صف می‌ماند و خودکار دوباره تلاش می‌شود؛ نیازی به ارسال مجدد نیست.\n"
+                "هیچ پستی بدون بازبینی و تأیید مدیر منتشر نخواهد شد.",
+                [[admin_button("مشاهده وضعیت پروژه", "aopen|" + project["id"])],
+                 [admin_button("مشاهده صف پروژه‌ها", "alist|all")],
+                 [admin_button("محتوای تحلیلی", "analytics")]])
         elif mode == "analytics_text_input":
             project=analytics_v55.new_project(state,"source_text",text,user_id)
             project["status"]="converting"; analytics_save(state)
@@ -5949,10 +5957,11 @@ def analytics_menu(state, chat_id, message_id=None):
         [admin_button("🏠 منوی اصلی", "menu")],
     ]
     paused = "متوقف" if settings.get("paused") else "فعال"
+    waiting_ai = sum(1 for x in a.get("ai_queue", []) if isinstance(x, dict) and x.get("status") == "queued")
     text = (f"📚 محتوای تحلیلی — Raptor V{BOT_VERSION}\n"
             f"پروژه: {metrics['projects']} | پست: {metrics['posts']} | زمان‌بندی: {metrics['scheduled']} | منتشرشده: {metrics['published']}\n"
             f"فاقد تصویر: {metrics['images_missing']} | نیازمند بررسی/خطا: {metrics['draft'] + metrics['failed_or_uncertain']}\n"
-            f"صف تحلیلی: {paused} | منطقه زمانی: {settings.get('timezone', 'Asia/Tehran')}\n"
+            f"صف تحلیلی: {paused} | کارهای AI در انتظار: {waiting_ai} | منطقه زمانی: {settings.get('timezone', 'Asia/Tehran')}\n"
             f"بازه: {settings.get('start_hour',14):02d}:00 تا {settings.get('end_hour',21):02d}:00 | حالت: {settings.get('schedule_mode','auto')}")
     admin_render(chat_id, text, rows, message_id)
 
@@ -6087,7 +6096,12 @@ def analytics_open(state, chat_id, pid, message_id=None):
     posts = p.get("posts", [])
     counts = {status: sum(x.get("status") == status for x in posts) for status in {x.get("status", "unknown") for x in posts}}
     status_text = " | ".join(f"{k}:{v}" for k, v in sorted(counts.items())) or "بدون پست"
-    txt = (f"📁 {p.get('title','بدون عنوان')}\nشناسه: {pid}\nروش: {'تحقیق ' + str(p.get('ai_provider_override') or 'Gemini') if p.get('kind') == 'research' else 'متن ورودی'}\n"
+    if p.get("kind") == "research":
+        method_text = (f"تحقیق: {analytics_provider_display(p.get('research_ai_provider'))} | "
+                       f"تولید پست: {analytics_provider_display(p.get('posts_ai_provider'))}")
+    else:
+        method_text = f"تبدیل متن با: {analytics_provider_display(p.get('posts_ai_provider') or p.get('last_ai_provider'))}"
+    txt = (f"📁 {p.get('title','بدون عنوان')}\nشناسه: {pid}\nموتورهای استفاده‌شده: {method_text}\n"
            f"وضعیت پروژه: {p.get('status')} | توقف پروژه: {'بله' if p.get('paused') else 'خیر'} | ایجاد: {datetime.fromtimestamp(p.get('created_at',now_ts()),timezone.utc):%Y-%m-%d %H:%M} UTC\n"
            f"موضوع/ورودی: {str(p.get('topic') or p.get('source_text') or '')[:500]}\n"
            f"منابع: {len(p.get('sources',[]))} | گالری پروژه: {len(p.get('images',[]))} | پست‌ها: {len(posts)}\n"
@@ -6103,7 +6117,10 @@ def analytics_open(state, chat_id, pid, message_id=None):
         rows.append([admin_button("✏️ ویرایش مقاله/متن اصلی", "aeditarticle|" + pid)])
         if p.get("sources"): rows.append([admin_button("🔗 منابع", "asources|" + pid)])
         if p.get("kind") == "research" and not p.get("approved_article"):
-            rows.append([admin_button("✅ تأیید مقاله و تولید پست‌ها", "aresearchok|" + pid)])
+            if posts:
+                rows.append([admin_button("✅ تأیید مقاله (پیش‌نویس‌ها آماده‌اند)", "aarticleapprove|" + pid)])
+            else:
+                rows.append([admin_button("✅ تأیید مقاله و تولید پست‌ها", "aresearchok|" + pid)])
         if p.get("kind") == "research": rows.append([admin_button("➕ تکمیل تحقیق با اطلاعات جدید", "aresearchupdate|" + pid)])
     if posts:
         rows.append([admin_button("🔄 بازتولید همه پست‌ها", "aregenprompt|" + pid), admin_button("🖼 جست‌وجوی تصاویر", "aimages|" + pid)])
@@ -6133,7 +6150,10 @@ def analytics_show_article(state, chat_id, pid, page=0, message_id=None):
     nav.append(admin_button(f"صفحه {page+1}/{len(chunks)}", f"aarticle|{pid}|{page}"))
     if page + 1 < len(chunks): nav.append(admin_button("بعدی ➡️", f"aarticle|{pid}|{page+1}"))
     rows.append(nav)
-    rows.append([admin_button("✅ تأیید مقاله و تولید پست‌ها", "aresearchok|" + pid), admin_button("بازگشت", "aopen|" + pid)])
+    if p.get("posts"):
+        rows.append([admin_button("✅ تأیید مقاله", "aarticleapprove|" + pid), admin_button("بازگشت", "aopen|" + pid)])
+    else:
+        rows.append([admin_button("✅ تأیید مقاله و تولید پست‌ها", "aresearchok|" + pid), admin_button("بازگشت", "aopen|" + pid)])
     admin_render(chat_id, f"📄 مقاله پروژه: {p.get('title','')}\nصفحه {page+1}/{len(chunks)}\n\n{chunks[page]}", rows, message_id)
 
 
@@ -6347,17 +6367,43 @@ def analytics_maybe_auto_schedule(state, project):
         return None
 
 
+def analytics_provider_display(provider):
+    provider = str(provider or "").lower()
+    if not provider:
+        return "ثبت نشده"
+    labels = {"groq": "Groq", "gemini": "Gemini", "mistral": "Mistral"}
+    if provider == "gemini":
+        model = os.environ.get("ANALYTICS_GEMINI_MODEL", GEMINI_MODEL).strip()
+    elif provider == "groq":
+        model = GROQ_MODEL
+    elif provider == "mistral":
+        model = MISTRAL_MODEL
+    else:
+        model = ""
+    return f"{labels.get(provider, provider)} ({model})" if model else labels.get(provider, provider)
+
+
 def analytics_apply_ai_runtime(state, project):
-    """Pass current panel provider switches/order into the isolated analytics subsystem."""
+    """Select any enabled analytical provider; rotate the first attempt between jobs."""
     st = analytics_v55.ensure_state(state)["settings"]
     order = runtime_provider_order(state)
+    if order:
+        cursor = safe_int(st.get("provider_cursor", 0), 0) % len(order)
+        order = order[cursor:] + order[:cursor]
+        st["provider_cursor"] = (cursor + 1) % len(order)
+        if not project.get("ai_provider_override_manual"):
+            project["ai_provider_override"] = order[0]
+    # The user explicitly requested provider-agnostic automatic work. Failover is
+    # therefore always enabled for normal research/conversion tasks.
     project["_ai_runtime"] = {
-        "auto_failover": bool(st.get("auto_failover", False)),
+        "auto_failover": True,
         "provider_order": list(order),
         "enabled_providers": list(order),
         "enforce_enabled": True,
         "manual_provider_override": bool(project.get("ai_provider_override_manual")),
     }
+    st["auto_failover"] = True
+    st["queue_when_ai_unavailable"] = True
     return project
 
 
@@ -6365,16 +6411,9 @@ def analytics_has_enabled_provider(state, project=None):
     """Return whether this project has at least one configured, enabled, non-cooling provider."""
     settings = analytics_v55.ensure_state(state)["settings"]
     enabled = runtime_provider_order(state)
-    primary = str((project or {}).get("ai_provider_override") or "gemini").lower()
-    auto_failover = bool(settings.get("auto_failover", False))
-    manual_override = bool((project or {}).get("ai_provider_override_manual"))
-    if auto_failover:
-        candidates = list(dict.fromkeys(([primary] if primary in AI_PROVIDER_ORDER else []) + enabled))
-        candidates = [x for x in candidates if x in enabled]
-    elif manual_override:
-        candidates = [primary] if primary in AI_PROVIDER_ORDER else []
-    else:
-        candidates = [primary] if primary in enabled else []
+    # Pending work is provider-agnostic: any enabled provider with credentials
+    # may pick it up, regardless of the provider used on the first attempt.
+    candidates = list(enabled)
     for provider in candidates:
         if AI_PROVIDER_KEYS.get(provider):
             ps = provider_state(state, provider)
@@ -6389,13 +6428,14 @@ def analytics_queue_task(state, project, operation, user_id=None, error=""):
     )
     project["_ai_runtime"] = {}
     analytics_save(state)
+    ANALYTICS_WAKE_EVENT.set()
     return task
 
 
 def analytics_try_queue_unavailable(state, project, operation, exc, user_id=None):
-    settings = analytics_v55.ensure_state(state)["settings"]
-    if not settings.get("queue_when_ai_unavailable"):
-        return False
+    # Durable retry is not an optional preference for analytical topic jobs:
+    # temporary provider/search downtime must never force the owner to resend input.
+    analytics_v55.ensure_state(state)["settings"]["queue_when_ai_unavailable"] = True
     if not isinstance(exc, analytics_v55.AIUnavailableError):
         return False
     analytics_queue_task(state, project, operation, user_id, sanitize_error_text(exc))
@@ -6450,6 +6490,19 @@ def analytics_process_ai_queue(state):
     try:
         if task.get("operation") == "research":
             analytics_v55.research_project(project)
+            # Persist the completed article before the next AI/image stage. If a
+            # provider becomes unavailable during splitting, resume from the article.
+            analytics_save(state)
+            try:
+                analytics_v55.split_into_posts(project)
+                analytics_v55.attach_images(project)
+                project["research_auto_pipeline_completed"] = True
+                project["approved_article"] = False
+                project["approved_posts"] = False
+            except analytics_v55.AIUnavailableError:
+                task["operation"] = "split"
+                analytics_save(state)
+                raise
         elif task.get("operation") == "split":
             analytics_v55.split_into_posts(project)
             analytics_v55.attach_images(project)
@@ -6464,11 +6517,26 @@ def analytics_process_ai_queue(state):
         analytics_v55._append_history(project, "ai_task_completed", f"task={task.get('id')}")
         analytics_save(state)
         log.info("Analytics AI queue task completed | task=%s | project=%s | op=%s", task.get("id"), project.get("id"), task.get("operation"))
+        if task.get("owner_id"):
+            try:
+                owner_chat = int(task.get("owner_id"))
+                admin_render(owner_chat,
+                    "✅ پردازش خودکار محتوای تحلیلی کامل شد.\n"
+                    f"موضوع: {project.get('title', 'بدون عنوان')}\n"
+                    f"منابع: {len(project.get('sources', []))} | پیش‌نویس‌ها: {len(project.get('posts', []))}\n"
+                    f"تصویرهای پیشنهادی: {sum(len(x.get('image_candidates', [])) for x in project.get('posts', []))}\n"
+                    f"موتور تحقیق: {analytics_provider_display(project.get('research_ai_provider'))}\n"
+                    f"موتور تولید پست: {analytics_provider_display(project.get('posts_ai_provider'))}\n"
+                    "مقاله، پست‌ها و گزینه‌های تصویر ذخیره شده‌اند؛ برای انتشار همچنان تأیید مدیر لازم است.",
+                    [[admin_button("📁 باز کردن پروژه", "aopen|" + project["id"])],
+                     [admin_button("📚 محتوای تحلیلی", "analytics")]])
+            except Exception as notify_exc:
+                log.warning("Analytics completion notification failed: %s", sanitize_error_text(notify_exc))
     except analytics_v55.AIUnavailableError as exc:
         task["status"] = "queued"
         task["last_error"] = sanitize_error_text(exc)[:500]
         task["updated_at"] = now_ts()
-        task["next_attempt_at"] = now_ts() + min(1800, 60 * (2 ** min(5, safe_int(task.get("attempts"), 1) - 1)))
+        task["next_attempt_at"] = now_ts() + min(180, 30 * (2 ** min(4, safe_int(task.get("attempts"), 1) - 1)))
         project["status"] = "queued_ai"
         project["last_error"] = task["last_error"]
         project.pop("_ai_runtime", None)
@@ -6484,6 +6552,16 @@ def analytics_process_ai_queue(state):
         analytics_v55._append_history(project, "ai_task_failed", f"task={task.get('id')}; {task['last_error'][:200]}")
         analytics_save(state)
         log.exception("Analytics AI queue task failed permanently | task=%s", task.get("id"))
+        if task.get("owner_id"):
+            try:
+                admin_render(int(task["owner_id"]),
+                    "⚠️ پردازش خودکار این پروژه به خطای غیرموقت رسید و در وضعیت خطا نگهداری شد.\n"
+                    f"موضوع: {project.get('title', 'بدون عنوان')}\nعلت: {task['last_error'][:1200]}",
+                    [[admin_button("بازکردن پروژه", "aopen|" + project["id"])],
+                     [admin_button("تلاش مجدد خودکار", "aresearchretry|" + project["id"])],
+                     [admin_button("محتوای تحلیلی", "analytics")]])
+            except Exception as notify_exc:
+                log.warning("Analytics failure notification failed: %s", sanitize_error_text(notify_exc))
 
 
 def analytics_process_due(state):
@@ -6534,7 +6612,7 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
     admin_answer_callback(callback.get("id", ""))
 
     area_by_action = {
-        "menu": "stats", "stats": "stats", "analytics": "analytics", "anewresearch": "analytics", "anewtext": "analytics", "alist": "analytics", "aopen": "analytics", "aarticle": "analytics", "aresearchok": "analytics", "areject": "analytics", "apost": "analytics", "aposts": "analytics", "apostapprove": "analytics", "aschedule": "analytics", "apaus": "analytics", "aresume": "analytics", "asources": "analytics", "aimages": "analytics", "aimage": "analytics", "aapprove": "analytics", "acancel": "analytics", "asettings": "analytics", "aaddimg": "analytics", "amanual": "analytics", "atimezone": "analytics", "aslot": "analytics", "amode": "analytics", "aimagereq": "analytics", "settings": "settings", "setting": "settings", "setprompt": "settings",
+        "menu": "stats", "stats": "stats", "newsengine": "settings", "analytics": "analytics", "anewresearch": "analytics", "anewtext": "analytics", "alist": "analytics", "aopen": "analytics", "aarticle": "analytics", "aresearchok": "analytics", "areject": "analytics", "apost": "analytics", "aposts": "analytics", "apostapprove": "analytics", "aschedule": "analytics", "apaus": "analytics", "aresume": "analytics", "asources": "analytics", "aimages": "analytics", "aimage": "analytics", "aapprove": "analytics", "acancel": "analytics", "asettings": "analytics", "aaddimg": "analytics", "amanual": "analytics", "atimezone": "analytics", "aslot": "analytics", "amode": "analytics", "aimagereq": "analytics", "settings": "settings", "setting": "settings", "setprompt": "settings",
         "news": "history_view" if role == "observer" else "news", "queue": "queue", "queuepage": "queue",
         "q": "queue", "qedit": "queue", "qimg": "queue", "qdelay": "queue", "qpub": "queue", "qdel": "queue",
         "history": "history_view" if role == "observer" else "news", "historypage": "history_view" if role == "observer" else "news", "h": "history_view" if role == "observer" else "news",
@@ -6551,7 +6629,7 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
     }
     area_by_action.update({name: "analytics" for name in (
         "anewfile", "asearch", "acalendar", "areport", "agallery", "aaddprojimg", "agprev",
-        "aresearchupdate", "aresearchretry", "afallbackresearch", "aregenprompt", "aregenerate",
+        "aresearchupdate", "aresearchretry", "afallbackresearch", "aarticleapprove", "aregenprompt", "aregenerate",
         "aapprovepost", "adraftpost", "arejectpost", "apreview", "apostversions", "aassignimg", "aeditpost", "arewrite", "abulkclear", "aeditarticle", "aedittitle", "arewritecustom", "aimagequery", "aimgup", "aimgdown", "afallbackposts", "afallbackrewrite", "afallbackaddendum",
         "aremoveimg", "aimgswap", "aimagepolicy", "asingle", "aunschedule", "apublishprompt",
         "apublishnow", "acancelprompt", "aarchiveprompt", "aarchive", "abulk", "abulktoggle", "aifailover", "aiqueue", "aifailover", "aiqueue",
@@ -6564,12 +6642,25 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
         admin_render(chat_id, "این سطح دسترسی اجازه این عملیات را ندارد.", [[admin_button("منوی اصلی", "menu")]], message_id)
         return
 
-    if action == "analytics":
+    if action == "newsengine":
+        enabled = not bool(state.get("_news_engine_enabled", True))
+        state["_news_engine_enabled"] = enabled
+        runtime = state.setdefault("_runtime", {})
+        runtime["news_engine_paused"] = not enabled
+        if enabled:
+            runtime.pop("news_engine_paused_at", None)
+        else:
+            runtime["news_engine_paused_at"] = now_ts()
+        save_state(state)
+        record_admin_activity(state, user_id, "تغییر وضعیت موتور اخبار", "فعال" if enabled else "متوقف")
+        log.warning("News engine manually %s by admin %s", "enabled" if enabled else "paused", user_id)
+        admin_show_menu(chat_id, message_id, role)
+    elif action == "analytics":
         analytics_menu(state, chat_id, message_id)
     elif action in {"anewresearch", "anewtext", "anewfile"}:
         if action == "anewresearch":
             mode = "analytics_research_input"
-            prompt = "موضوع تحقیق را بفرست. ابتدا جست‌وجوی واقعی وب انجام می‌شود. ارائه‌دهنده پیش‌فرض Gemini است؛ در صورت روشن‌بودن Failover، هوش مصنوعی فعال بعدی خودکار جایگزین می‌شود. اگر صف انتظار AI روشن باشد، پروژه هنگام نبود ارائه‌دهنده در صف می‌ماند."
+            prompt = "فقط موضوع را بفرست. ربات به‌صورت خودکار با هرکدام از Gemini، Groq یا Mistral که فعال باشد تحقیق می‌کند، مقاله تحلیلی و پیش‌نویس پست‌ها می‌سازد و تصویر مرتبط پیدا می‌کند. اگر سرویس‌ها موقتاً در دسترس نباشند، موضوع در صف پایدار می‌ماند و بدون ارسال مجدد خودکار ادامه می‌یابد."
         elif action == "anewfile":
             mode = "analytics_file_input"
             prompt = "یک فایل TXT، MD، PDF یا DOCX حداکثر ۱۰ مگابایت بفرست. متن فایل استخراج و به پروژه مستقل تبدیل می‌شود."
@@ -6608,6 +6699,15 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
         analytics_show_article(state, chat_id, parts[1], safe_int(parts[2], 0) if len(parts) > 2 else 0, message_id)
     elif action == "asources" and len(parts) > 1:
         analytics_show_sources(state, chat_id, parts[1], message_id)
+    elif action == "aarticleapprove" and len(parts) > 1:
+        project = analytics_v55.ensure_state(state)["projects"].get(parts[1])
+        if not project or not project.get("article"):
+            admin_render(chat_id, "مقاله برای تأیید پیدا نشد.", [[admin_button("پروژه‌ها", "alist|all")]], message_id)
+        else:
+            project["approved_article"] = True
+            analytics_v55._append_history(project, "article_approved", "مقاله پس از تولید خودکار پیش‌نویس‌ها تأیید شد.", user_id)
+            analytics_save(state)
+            analytics_open(state, chat_id, parts[1], message_id)
     elif action == "aresearchok" and len(parts) > 1:
         a = analytics_v55.ensure_state(state); p = a["projects"].get(parts[1])
         if not p or not p.get("article"):
@@ -6638,13 +6738,14 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
         p = analytics_v55.ensure_state(state)["projects"].get(parts[1])
         try:
             if not p: raise RuntimeError("پروژه پیدا نشد.")
-            p["ai_provider_override"] = "gemini"; p["ai_provider_override_manual"] = True; p["status"] = "researching"
-            analytics_apply_ai_runtime(state, p)
-            analytics_v55.research_project(p); p.pop("_ai_runtime", None); analytics_save(state)
-            admin_render(chat_id, "تحقیق دوباره با Gemini آماده بازبینی است.", [[admin_button("مشاهده مقاله", f"aarticle|{p['id']}|0")], [admin_button("پروژه", "aopen|" + p["id"])]], message_id)
+            p["ai_provider_override_manual"] = False
+            p["status"] = "queued_ai"
+            task = analytics_queue_task(state, p, "research", user_id,
+                                        "درخواست تلاش مجدد؛ انتخاب خودکار بین موتورهای فعال.")
+            admin_render(chat_id, "📥 تلاش مجدد در صف پایدار قرار گرفت؛ هرکدام از سه موتور که فعال باشد انتخاب می‌شود و در صورت قطعی، موضوع در صف می‌ماند.",
+                         [[admin_button("مشاهده پروژه", "aopen|" + p["id"])], [admin_button("محتوای تحلیلی", "analytics")]], message_id)
         except Exception as exc:
-            if p: p["status"] = "error"; p["last_error"] = sanitize_error_text(exc); analytics_save(state)
-            admin_render(chat_id, "تلاش مجدد Gemini ناموفق بود: " + sanitize_error_text(exc), [[admin_button("بازگشت", "aopen|" + parts[1])]], message_id)
+            admin_render(chat_id, "ثبت تلاش مجدد ناموفق بود: " + sanitize_error_text(exc), [[admin_button("بازگشت", "aopen|" + parts[1])]], message_id)
     elif action == "afallbackresearch" and len(parts) > 2:
         provider = parts[2].lower()
         p = analytics_v55.ensure_state(state)["projects"].get(parts[1])
@@ -7089,20 +7190,16 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
     elif action == "asettings":
         a = analytics_v55.ensure_state(state); st = a["settings"]
         queue_count = sum(1 for x in a.get("ai_queue", []) if isinstance(x, dict) and x.get("status") == "queued")
-        admin_render(chat_id, f"⚙️ تنظیمات تحلیلی\nمنطقه زمانی: {st.get('timezone')}\nحالت زمان‌بندی: {st.get('schedule_mode')}\nالزام تصویر پیش‌فرض: {st.get('require_image')}\nبازه: {st.get('start_hour')}:00 تا {st.get('end_hour')}:00\nفاصله از خبر: {st.get('min_news_gap_minutes')} دقیقه\nپروژه در روز: {st.get('daily_project_limit',1)}\nپیش‌فرض تعداد پست: {st.get('default_post_count',6)}\nFailover خودکار: {'روشن' if st.get('auto_failover') else 'خاموش'}\nصف انتظار AI: {'روشن' if st.get('queue_when_ai_unavailable') else 'خاموش'} | پروژه‌های منتظر: {queue_count}",
-                     [[admin_button("🔀 فعال/غیرفعال Failover خودکار", "aifailover")], [admin_button("📥 صف پروژه هنگام نبود AI", "aiqueue")], [admin_button("تغییر منطقه زمانی", "atimezone")], [admin_button("تغییر بازه انتشار", "aslot")], [admin_button("تغییر حالت خودکار/دستی", "amode")], [admin_button("تغییر الزام تصویر", "aimagereq")], [admin_button("توقف/ادامه صف انتشار تحلیلی", "apaus" if not st.get("paused") else "aresume")], [admin_button("بازگشت", "analytics")]], message_id)
-    elif action == "aifailover":
+        st["auto_failover"] = True
+        st["queue_when_ai_unavailable"] = True
+        admin_render(chat_id, f"⚙️ تنظیمات تحلیلی\nمنطقه زمانی: {st.get('timezone')}\nحالت زمان‌بندی: {st.get('schedule_mode')}\nالزام تصویر پیش‌فرض: {st.get('require_image')}\nبازه: {st.get('start_hour')}:00 تا {st.get('end_hour')}:00\nفاصله از خبر: {st.get('min_news_gap_minutes')} دقیقه\nپروژه در روز: {st.get('daily_project_limit',1)}\nپیش‌فرض تعداد پست: {st.get('default_post_count',6)}\nانتخاب خودکار موتور AI: همیشه روشن (Gemini / Groq / Mistral)\nصف پایدار و تلاش مجدد: همیشه روشن | پروژه‌های منتظر: {queue_count}",
+                     [[admin_button("تغییر منطقه زمانی", "atimezone")], [admin_button("تغییر بازه انتشار", "aslot")], [admin_button("تغییر حالت خودکار/دستی", "amode")], [admin_button("تغییر الزام تصویر", "aimagereq")], [admin_button("توقف/ادامه صف انتشار تحلیلی", "apaus" if not st.get("paused") else "aresume")], [admin_button("بازگشت", "analytics")]], message_id)
+    elif action in {"aifailover", "aiqueue"}:
         st = analytics_v55.ensure_state(state)["settings"]
-        st["auto_failover"] = not bool(st.get("auto_failover", False))
+        st["auto_failover"] = True
+        st["queue_when_ai_unavailable"] = True
         analytics_save(state)
-        record_admin_activity(state, user_id, "تغییر Failover تحلیلی", str(st["auto_failover"]))
-        admin_render(chat_id, "Failover خودکار محتوای تحلیلی: " + ("روشن" if st["auto_failover"] else "خاموش"), [[admin_button("تنظیمات تحلیلی", "asettings")]], message_id)
-    elif action == "aiqueue":
-        st = analytics_v55.ensure_state(state)["settings"]
-        st["queue_when_ai_unavailable"] = not bool(st.get("queue_when_ai_unavailable", False))
-        analytics_save(state)
-        record_admin_activity(state, user_id, "تغییر صف انتظار AI تحلیلی", str(st["queue_when_ai_unavailable"]))
-        admin_render(chat_id, "صف انتظار پروژه هنگام نبود هوش مصنوعی: " + ("روشن" if st["queue_when_ai_unavailable"] else "خاموش"), [[admin_button("تنظیمات تحلیلی", "asettings")]], message_id)
+        admin_render(chat_id, "✅ انتخاب خودکار بین سه موتور و صف پایدار همیشه فعال است و برای از دست نرفتن موضوع قابل خاموش‌کردن نیست.", [[admin_button("تنظیمات تحلیلی", "asettings")]], message_id)
     elif action == "atimezone":
         ask_admin_input(state, user_id, chat_id, {"type": "analytics_timezone_input"}, "نام منطقه زمانی معتبر IANA را بفرست؛ مثال: Asia/Tehran یا Europe/Berlin.", message_id)
     elif action == "aslot":
@@ -7494,7 +7591,7 @@ def extract_analytics_document_text(document):
             reader = PdfReader(io.BytesIO(data))
             extracted = "\n\n".join((page.extract_text() or "") for page in reader.pages[:300])
         except ImportError as exc:
-            raise RuntimeError("برای استخراج PDF، بسته pypdf نصب نیست؛ requirements.txt نسخه V5.7 را نصب کن.") from exc
+            raise RuntimeError("برای استخراج PDF، بسته pypdf نصب نیست؛ requirements.txt بسته فعلی را نصب کن.") from exc
         except Exception as exc:
             raise RuntimeError("استخراج متن PDF انجام نشد؛ احتمال دارد PDF اسکن‌شده و فاقد متن قابل‌استخراج باشد.") from exc
     else:
@@ -7507,7 +7604,7 @@ def extract_analytics_document_text(document):
                     parts.append(" | ".join(cell.text.strip() for cell in row.cells))
             extracted = "\n".join(parts)
         except ImportError as exc:
-            raise RuntimeError("برای استخراج DOCX، بسته python-docx نصب نیست؛ requirements.txt نسخه V5.7 را نصب کن.") from exc
+            raise RuntimeError("برای استخراج DOCX، بسته python-docx نصب نیست؛ requirements.txt بسته فعلی را نصب کن.") from exc
     extracted = str(extracted or "").strip()
     if not extracted:
         raise ValueError("از فایل متن قابل‌استخراج پیدا نشد؛ برای PDF اسکن‌شده، OCR در این نسخه فعال نیست.")
@@ -8190,7 +8287,7 @@ def main():
             with STATE_LOCK:
                 analytics_process_due(state)
         except Exception as analytics_exc:
-            log.exception("چرخه انتشار تحلیلی V5.7 با خطا متوقف شد: %s", sanitize_error_text(analytics_exc))
+            log.exception("چرخه انتشار تحلیلی V5.9 با خطا متوقف شد: %s", sanitize_error_text(analytics_exc))
             with STATE_LOCK:
                 a = analytics_v55.ensure_state(state)
                 a.setdefault("runtime_errors", []).append({"at": now_ts(), "error": sanitize_error_text(analytics_exc)[:400]})
@@ -8200,7 +8297,18 @@ def main():
         sleep_for = max(5, POLL_INTERVAL_SECONDS - int(elapsed))
         if state.get("_profile") == "war" and state.get("_pending_queue"):
             sleep_for = min(sleep_for, 5)
-        time.sleep(sleep_for)
+        # Keep draining durable analytical jobs without waiting for the full
+        # news polling interval. A retry still respects next_attempt_at inside
+        # analytics_process_ai_queue; this only bounds queue pickup latency.
+        try:
+            analytics_queue = analytics_v55.ensure_state(state).get("ai_queue", [])
+            if any(isinstance(job, dict) and job.get("status") == "queued" for job in analytics_queue):
+                sleep_for = min(sleep_for, 10)
+        except Exception:
+            pass
+        # Preserve normal news polling cadence while immediately waking for new topics.
+        ANALYTICS_WAKE_EVENT.wait(timeout=sleep_for)
+        ANALYTICS_WAKE_EVENT.clear()
 
 
 if __name__ == "__main__":

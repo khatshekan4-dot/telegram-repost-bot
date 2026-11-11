@@ -1,7 +1,7 @@
-"""Raptor V5.7 independent analytical-content subsystem.
+"""Raptor V5.9 independent analytical-content subsystem.
 
 All analytics records live under state['_analytics']; news queue/configuration is read-only.
-Gemini is the default and exclusive provider for analytical research and content operations.
+Analytical research automatically rotates through enabled Gemini, Groq and Mistral providers.
 No operation publishes without explicit post approval and image validation.
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ MIN_POSTS = 5
 MAX_POSTS = 6
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 DEFAULT_TZ = "Asia/Tehran"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 class AnalyticsError(RuntimeError):
     """Expected user-facing analytics error."""
@@ -48,9 +48,10 @@ def _default_settings() -> dict:
         "require_image": True, "target_chat_id": os.getenv("ANALYTICS_TARGET_CHAT_ID", os.getenv("TARGET_CHAT_ID", "")).strip(),
         "auto_reschedule": True, "daily_project_limit": 1,
         "default_post_count": 6, "default_tone": "تحلیلی، طبیعی و گفت‌وگومحور",
-        # Opt-in switches preserve the previous default behavior until the owner enables them.
-        "auto_failover": False,
-        "queue_when_ai_unavailable": False,
+        # Analytical research is autonomous by default: all enabled providers are tried,
+        # and retryable work is persisted until a provider/search endpoint recovers.
+        "auto_failover": True,
+        "queue_when_ai_unavailable": True,
         "updated_at": now_ts(),
     }
 
@@ -61,11 +62,19 @@ def ensure_state(state: dict) -> dict:
     if not isinstance(a, dict):
         a = {}
         state["_analytics"] = a
+    previous_schema = int(a.get("schema_version", 0) or 0)
     a.setdefault("schema_version", SCHEMA_VERSION)
     a.setdefault("projects", {})
     a.setdefault("settings", {})
     for key, value in _default_settings().items():
         a["settings"].setdefault(key, value)
+    # V4 makes automatic provider failover and durable retry the default, including
+    # installations whose earlier V5.7 migration had stored these flags as False.
+    if previous_schema < 4:
+        a["settings"]["auto_failover"] = True
+        a["settings"]["queue_when_ai_unavailable"] = True
+        a["settings"]["automatic_provider_selection"] = True
+    a["settings"].setdefault("automatic_provider_selection", True)
     a.setdefault("history", [])
     a.setdefault("runtime_errors", [])
     a.setdefault("ai_queue", [])
@@ -196,7 +205,7 @@ def gemini_call(prompt: str, *, model=None, use_search=False, timeout=90):
 
 
 def _openai_compatible_call(provider: str, prompt: str, timeout=90):
-    """Manual-only alternative provider. The caller must explicitly choose it in the UI."""
+    """Call Groq or Mistral through their OpenAI-compatible chat-completions APIs."""
     provider = str(provider or "").lower()
     if provider == "groq":
         keys = [x.strip() for x in os.getenv("GROQ_API_KEYS", os.getenv("GROQ_API_KEY", "")).split(",") if x.strip()]
@@ -222,7 +231,7 @@ def _openai_compatible_call(provider: str, prompt: str, timeout=90):
             }, timeout=timeout)
             if r.status_code >= 400:
                 errors.append(f"HTTP {r.status_code}: {_redact(r.text[:200], keys)}")
-                if r.status_code in {408, 409, 425, 429, 500, 502, 503, 504}:
+                if r.status_code in {401, 403, 408, 409, 425, 429, 500, 502, 503, 504}:
                     retryable_failure = True
                 continue
             obj = r.json()
@@ -243,11 +252,25 @@ def _openai_compatible_call(provider: str, prompt: str, timeout=90):
     raise AnalyticsError(message)
 
 
+def _rotate_project_provider_order(project: dict) -> None:
+    runtime = project.get("_ai_runtime") if isinstance(project.get("_ai_runtime"), dict) else None
+    if not runtime:
+        return
+    order = [str(x).lower() for x in runtime.get("provider_order", [])
+             if str(x).lower() in {"gemini", "groq", "mistral"}]
+    if len(order) > 1:
+        order = order[1:] + order[:1]
+        runtime["provider_order"] = order
+        runtime["enabled_providers"] = list(order)
+        if not runtime.get("manual_provider_override"):
+            project["ai_provider_override"] = order[0]
+
+
 def project_ai_call(project: dict, prompt: str, *, use_search=False, timeout=90):
-    """Use the selected provider, optionally falling through the active provider order."""
+    """Use every enabled provider automatically; an explicit manual override stays exclusive."""
     primary = str(project.get("ai_provider_override") or "gemini").lower()
     runtime = project.get("_ai_runtime") if isinstance(project.get("_ai_runtime"), dict) else {}
-    auto_failover = bool(runtime.get("auto_failover", False))
+    auto_failover = bool(runtime.get("auto_failover", True))
     enabled = runtime.get("enabled_providers", [])
     order = runtime.get("provider_order", [])
 
@@ -255,21 +278,24 @@ def project_ai_call(project: dict, prompt: str, *, use_search=False, timeout=90)
     enabled_set = {str(x).lower() for x in enabled if str(x).lower() in valid_providers}
     enforce_enabled = bool(runtime.get("enforce_enabled", False))
     manual_override = bool(runtime.get("manual_provider_override", False))
-    if auto_failover:
-        candidates = [primary] + [str(x).lower() for x in order]
+    normalized_order = list(dict.fromkeys(str(x).lower() for x in order if str(x).lower() in valid_providers))
+    if auto_failover and not manual_override:
+        # The caller may rotate this order between jobs. Do not put Gemini first
+        # merely because it was the historical default provider.
+        candidates = normalized_order or ["groq", "gemini", "mistral"]
+    elif auto_failover:
+        candidates = [primary] + normalized_order
         candidates = list(dict.fromkeys(x for x in candidates if x in valid_providers))
-        if enforce_enabled:
-            candidates = [x for x in candidates if x in enabled_set]
     else:
         candidates = [primary] if primary in valid_providers else ["gemini"]
-        if enforce_enabled and not manual_override and primary not in enabled_set:
-            candidates = []
+    if enforce_enabled:
+        candidates = [x for x in candidates if x in enabled_set]
 
     errors = []
     for provider in candidates:
         try:
             if provider == "gemini":
-                result = gemini_call(prompt, use_search=use_search, timeout=timeout)
+                result = gemini_call(prompt, use_search=True, timeout=timeout)
             else:
                 alternate_prompt = prompt
                 if use_search:
@@ -286,9 +312,11 @@ def project_ai_call(project: dict, prompt: str, *, use_search=False, timeout=90)
     if not candidates:
         raise AIUnavailableError("هیچ ارائه‌دهنده فعال و مجازی برای این پروژه تحلیلی در دسترس نیست؛ پروژه می‌تواند در صف انتظار بماند.")
     message = "تمام ارائه‌دهندگان فعال محتوای تحلیلی ناموفق بودند: " + " | ".join(errors[-3:])
-    if any("HTTP 4" in x for x in errors) and not any("HTTP 429" in x or "HTTP 5" in x for x in errors):
-        raise AnalyticsError(message)
-    raise AIUnavailableError(message)
+    retryable_markers = ("HTTP 401", "HTTP 403", "HTTP 408", "HTTP 409", "HTTP 425",
+                         "HTTP 429", "HTTP 5", "Timeout", "Connection", "RequestException")
+    if any(marker in error for error in errors for marker in retryable_markers):
+        raise AIUnavailableError(message)
+    raise AnalyticsError(message)
 
 
 def enqueue_ai_task(state: dict, project_id: str, operation: str, *, args=None, owner_id=None, error="") -> dict:
@@ -319,36 +347,129 @@ def enqueue_ai_task(state: dict, project_id: str, operation: str, *, args=None, 
     return task
 
 
+def _search_url_from_ddg(href: str) -> str:
+    """Resolve DuckDuckGo's redirect links to their actual public destination."""
+    from urllib.parse import parse_qs, unquote, urlparse
+    raw = unquote(str(href or "").strip())
+    if raw.startswith("//"):
+        raw = "https:" + raw
+    parsed = urlparse(raw)
+    if parsed.hostname and parsed.hostname.endswith("duckduckgo.com"):
+        target = parse_qs(parsed.query).get("uddg", [""])[0]
+        if target:
+            raw = unquote(target)
+            parsed = urlparse(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return ""
+    if parsed.hostname in {"duckduckgo.com", "html.duckduckgo.com", "bing.com"}:
+        return ""
+    return raw
+
+
+def _search_ddg(query: str, limit: int):
+    r = requests.get(
+        "https://html.duckduckgo.com/html/", params={"q": query},
+        headers={"User-Agent": "Mozilla/5.0 (compatible; RaptorAnalytics/5.9)"}, timeout=18,
+    )
+    r.raise_for_status()
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(r.text, "html.parser")
+    results = []
+    for item in soup.select(".result"):
+        link = item.select_one("a.result__a")
+        snippet = item.select_one(".result__snippet")
+        if not link:
+            continue
+        url = _search_url_from_ddg(link.get("href", ""))
+        if not url:
+            continue
+        results.append({
+            "title": link.get_text(" ", strip=True), "url": url,
+            "snippet": snippet.get_text(" ", strip=True) if snippet else "",
+            "retrieved_at": now_ts(), "search_provider": "DuckDuckGo",
+        })
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _search_bing_rss(query: str, limit: int):
+    """Bing RSS provides a lightweight independent fallback if DDG HTML is blocked."""
+    import xml.etree.ElementTree as ET
+    r = requests.get(
+        "https://www.bing.com/search", params={"q": query, "format": "rss"},
+        headers={"User-Agent": "Mozilla/5.0 (compatible; RaptorAnalytics/5.9)"}, timeout=18,
+    )
+    r.raise_for_status()
+    root = ET.fromstring(r.text)
+    results = []
+    for item in root.findall(".//item"):
+        title = (item.findtext("title") or "").strip()
+        url = _search_url_from_ddg(item.findtext("link") or "")
+        snippet = (item.findtext("description") or "").strip()
+        if not title or not url:
+            continue
+        results.append({"title": title, "url": url, "snippet": snippet,
+                        "retrieved_at": now_ts(), "search_provider": "Bing RSS"})
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _search_wikipedia(query: str, limit: int):
+    """Small factual-background fallback; not treated as a substitute for diverse sources."""
+    r = requests.get(
+        "https://en.wikipedia.org/w/api.php",
+        params={"action": "query", "list": "search", "srsearch": query,
+                "srlimit": min(8, max(1, limit)), "format": "json", "utf8": 1},
+        headers={"User-Agent": "RaptorAnalytics/5.9 (research bot)"}, timeout=15,
+    )
+    r.raise_for_status()
+    rows = r.json().get("query", {}).get("search", [])
+    results = []
+    for row in rows:
+        title = str(row.get("title", "")).strip()
+        pageid = row.get("pageid")
+        if not title or not pageid:
+            continue
+        results.append({"title": title, "url": f"https://en.wikipedia.org/?curid={int(pageid)}",
+                        "snippet": re.sub(r"<[^>]+>", " ", str(row.get("snippet", ""))),
+                        "retrieved_at": now_ts(), "search_provider": "Wikipedia"})
+    return results
+
+
 def web_search(query: str, limit=8):
-    """Retrieve real search results via DuckDuckGo HTML; failure is explicit."""
+    """Multi-engine search with deduplication; transient search outages remain retryable."""
     q = (query or "").strip()
     if not q:
         return []
-    try:
-        r = requests.get("https://html.duckduckgo.com/html/", params={"q": q},
-                         headers={"User-Agent": "Mozilla/5.0 (compatible; RaptorV56/1.0)"}, timeout=20)
-        r.raise_for_status()
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(r.text, "html.parser")
-        results, seen = [], set()
-        for item in soup.select(".result")[:max(1, min(12, int(limit)) * 2)]:
-            link = item.select_one("a.result__a")
-            snippet = item.select_one(".result__snippet")
-            if not link:
-                continue
-            href = link.get("href", "")
-            parsed = urlparse(href)
-            if parsed.scheme not in {"http", "https"} or not parsed.hostname or href in seen:
-                continue
-            seen.add(href)
-            results.append({"title": link.get_text(" ", strip=True), "url": href,
-                            "snippet": snippet.get_text(" ", strip=True) if snippet else "",
-                            "retrieved_at": now_ts()})
-            if len(results) >= limit:
-                break
-        return results
-    except Exception as exc:
-        raise AnalyticsError(f"جست‌وجوی واقعی وب ناموفق بود؛ تحقیق بدون جست‌وجو ادامه داده نشد. {type(exc).__name__}: {_redact(exc)}")
+    merged, seen, errors = [], set(), []
+    engines = (
+        ("DuckDuckGo", _search_ddg),
+        ("Bing RSS", _search_bing_rss),
+        ("Wikipedia", _search_wikipedia),
+    )
+    for label, search_fn in engines:
+        try:
+            batch = search_fn(q, max(1, min(10, int(limit))))
+            for item in batch:
+                url = str(item.get("url", "")).strip()
+                if not url or url in seen:
+                    continue
+                seen.add(url)
+                merged.append(item)
+                if len(merged) >= max(1, int(limit)):
+                    return merged
+        except Exception as exc:
+            errors.append(f"{label}: {type(exc).__name__}")
+            log.warning("Analytics search provider %s unavailable: %s", label, type(exc).__name__)
+    if len(merged) < 3:
+        detail = "; ".join(errors[-3:]) or "نتایج معتبر کافی دریافت نشد"
+        raise AIUnavailableError(
+            f"جست‌وجوی وب فعلاً کمتر از ۳ نتیجه معتبر پیدا کرد ({len(merged)} نتیجه). "
+            f"پروژه در صف می‌ماند و خودکار دوباره تلاش می‌شود. {detail}"
+        )
+    return merged
 
 
 def _split_article_sources(text: str):
@@ -367,26 +488,36 @@ def research_project(project: dict):
     topic = project.get("topic", "").strip()
     if not topic:
         raise AnalyticsError("موضوع تحقیق خالی است.")
-    results = web_search(topic + " official technical history defense research", 8)
+    results = web_search(topic, 8)
     if len(results) < 3:
         raise AnalyticsError(f"جست‌وجوی وب فقط {len(results)} نتیجه قابل استفاده داد؛ حداقل ۳ نتیجه لازم است تا تحقیق ضعیف به مقاله تبدیل نشود.")
     sources = [{"title": x["title"], "url": x["url"], "snippet": x["snippet"],
-                "retrieved_at": x.get("retrieved_at", now_ts()), "status": "needs_review"} for x in results]
+                "retrieved_at": x.get("retrieved_at", now_ts()), "status": "needs_review",
+                "search_provider": x.get("search_provider", "unknown")} for x in results]
     evidence = "\n\n".join(f"[{i+1}] {s['title']}\nURL: {s['url']}\nخلاصه نتیجه: {s['snippet']}" for i, s in enumerate(sources))
     prompt = (
         "نقش: پژوهشگر و نویسنده فارسی‌زبان. از نتایج جست‌وجوی واقعی پیوست و در صورت نیاز Google Search grounding استفاده کن. "
         "منابع را در گزارش مدیریتی جدا کن؛ نام منابع/مستندات، فهرست منبع و هیچ URL را داخل ARTICLE نیاور و فقط در SOURCES ثبت کن. "
         "هیچ عدد، تاریخ، منبع یا پیوندی جعل نکن. گزارش منابع را جای مقاله نگذار. "
+        "نتایج جست‌وجو ممکن است فقط عنوان و خلاصه باشند؛ جزئیات فاقد پشتوانه را قطعی ننویس و برای مشخصات حساس چندمنبعی بودن را بررسی کن. "
         "میان داده تأییدشده، گزارش تأییدنشده، برآورد/تحلیل، اختلاف منابع و اطلاعات ناکافی تمایز بگذار. "
         "مشخصات نسخه‌های مختلف تجهیزات را مخلوط نکن. تاریخ انتشار منبع و تاریخ رویداد را در صورت وجود تفکیک کن. "
         "اگر شواهد کافی نیست، آن محدودیت را در متن مدیریتی و نه در ادعای قطعی توضیح بده. "
         "خروجی فارسی و دقیق با دو بخش ARTICLE و SOURCES باشد؛ SOURCES فقط در پنل مدیر استفاده می‌شود.\n\n"
         f"موضوع: {topic}\n\nنتایج جست‌وجوی وب:\n{evidence}"
     )
-    result, raw = project_ai_call(project, prompt, use_search=(project.get("ai_provider_override") or "gemini") == "gemini")
-    article = _split_article_sources(result)
+    article, raw = "", {}
+    last_output_error = ""
+    for attempt in range(3):
+        result, raw = project_ai_call(project, prompt, use_search=True)
+        article = _split_article_sources(result)
+        if len(article) >= 100:
+            break
+        last_output_error = "پاسخ مدل برای مقاله تحلیلی بیش از حد کوتاه بود."
+        _rotate_project_provider_order(project)
     if len(article) < 100:
-        raise AnalyticsError("خروجی تحقیق به مقاله کافی تبدیل نشد؛ پروژه برای بازبینی/تلاش مجدد حفظ شد.")
+        raise AnalyticsError(last_output_error or "خروجی تحقیق به مقاله کافی تبدیل نشد؛ پروژه برای بازبینی/تلاش مجدد حفظ شد.")
+    project["research_ai_provider"] = project.get("last_ai_provider") or project.get("ai_provider_override")
     project.setdefault("article_versions", []).append({"at": now_ts(), "article": project.get("article", ""), "action": "before_research"})
     project["article"] = article
     project["sources"] = sources
@@ -412,10 +543,11 @@ def research_project(project: dict):
             known_urls.add(url)
     project["sources"] = sources
     project["research_grounding"] = {
-        "search_results": len(sources), "duckduckgo_results": len(results),
+        "search_results": len(sources),
+        "search_providers": sorted({str(x.get("search_provider", "unknown")) for x in sources}),
         "gemini_grounding_metadata": bool(grounding), "completed_at": now_ts(),
-        "provider": project.get("last_ai_provider") or project.get("ai_provider_override") or "gemini",
-        "method": "DuckDuckGo HTML + Gemini Google Search grounding attempted" if project.get("last_ai_provider", project.get("ai_provider_override") or "gemini") == "gemini" else "DuckDuckGo HTML + alternate provider using attached search evidence",
+        "provider": project.get("last_ai_provider") or project.get("ai_provider_override") or "unknown",
+        "method": "Multi-engine public web search; Gemini Google Search grounding used when Gemini completed the research" if project.get("last_ai_provider") == "gemini" else "Multi-engine public web search with attached search evidence",
     }
     project["status"] = "review_research"
     project["last_error"] = ""
@@ -484,9 +616,9 @@ def split_into_posts(project: dict, count=None, tone=None):
     tone = tone or os.getenv("ANALYTICS_DEFAULT_TONE", "تحلیلی، طبیعی و گفت‌وگومحور")
     # First model attempt. If post validation fails, ask Gemini to repair before rejecting.
     last_error = ""
-    for attempt in range(2):
+    for attempt in range(3):
         try:
-            obj, raw_posts = _call_split_model(project, source, target_count, tone, strict=(attempt == 1))
+            obj, raw_posts = _call_split_model(project, source, target_count, tone, strict=(attempt >= 1))
             if not 1 <= len(raw_posts) <= MAX_POSTS:
                 raise AnalyticsError("تعداد خروجی پست‌ها خارج از محدوده است.")
             candidate_posts = []
@@ -513,6 +645,7 @@ def split_into_posts(project: dict, count=None, tone=None):
             validation = validate_post_set(candidate_posts, require_images=False)
             if validation:
                 raise AnalyticsError("اعتبارسنجی مستقل پست‌ها ناموفق بود: " + "; ".join(validation[:4]))
+            project["posts_ai_provider"] = project.get("last_ai_provider") or project.get("ai_provider_override")
             old = project.get("posts", [])
             if old:
                 project.setdefault("versions", []).append({"at": now_ts(), "action": "before_regenerate_all", "posts": copy.deepcopy(old)})
@@ -525,73 +658,133 @@ def split_into_posts(project: dict, count=None, tone=None):
             project["updated_at"] = now_ts()
             _append_history(project, "posts_generated", f"count={len(candidate_posts)}; attempt={attempt+1}")
             return project
+        except AIUnavailableError:
+            # Service/network downtime must escape to the durable queue, not be
+            # converted into a permanent invalid-output error.
+            raise
         except AnalyticsError as exc:
             last_error = str(exc)
-            if attempt == 0:
+            if attempt < 2:
+                _rotate_project_provider_order(project)
                 continue
-    raise AnalyticsError("پس از یک تلاش اصلاحی خروجی معتبر تولید نشد؛ انتشار مسدود ماند. " + last_error)
+    raise AnalyticsError("پس از سه تلاش با ترتیب چرخشی موتورهای فعال خروجی معتبر تولید نشد؛ انتشار مسدود ماند. " + last_error)
+
+
+def _commons_search_once(query: str, limit: int):
+    """Search Commons file namespace and resolve real imageinfo URLs."""
+    headers = {"User-Agent": "RaptorAnalytics/5.9 (Telegram analytical content bot)"}
+    search = requests.get("https://commons.wikimedia.org/w/api.php", params={
+        "action": "query", "list": "search", "srsearch": f"filetype:bitmap {query}",
+        "srnamespace": 6, "srlimit": min(10, max(1, int(limit))), "format": "json",
+    }, headers=headers, timeout=18)
+    search.raise_for_status()
+    hits = search.json().get("query", {}).get("search", [])
+    pageids = [str(x.get("pageid")) for x in hits if x.get("pageid")]
+    if not pageids:
+        return []
+    details = requests.get("https://commons.wikimedia.org/w/api.php", params={
+        "action": "query", "pageids": "|".join(pageids), "prop": "imageinfo",
+        "iiprop": "url|mime|size", "iiurlwidth": 1200, "format": "json",
+    }, headers=headers, timeout=18)
+    details.raise_for_status()
+    pages = details.json().get("query", {}).get("pages", {})
+    out, seen = [], set()
+    for page in pages.values():
+        info = (page.get("imageinfo") or [{}])[0]
+        url = info.get("thumburl") or info.get("url", "")
+        parsed = urlparse(url)
+        mime = str(info.get("mime") or "").lower()
+        if parsed.scheme != "https" or parsed.hostname != "upload.wikimedia.org":
+            continue
+        if mime not in {"image/jpeg", "image/png", "image/webp"} or url in seen:
+            continue
+        seen.add(url)
+        try:
+            check = requests.get(url, headers={**headers, "Range": "bytes=0-1023"},
+                                 stream=True, timeout=8, allow_redirects=True)
+            final = urlparse(check.url)
+            content_type = str(check.headers.get("Content-Type", "")).lower()
+            length = int(check.headers.get("Content-Length", "0") or 0)
+            accessible = (check.status_code in {200, 206} and content_type.startswith("image/")
+                          and final.scheme == "https" and final.hostname == "upload.wikimedia.org"
+                          and (not length or length <= MAX_IMAGE_BYTES))
+            check.close()
+        except Exception:
+            accessible = False
+        if not accessible:
+            continue
+        title = str(page.get("title", ""))
+        out.append({
+            "title": title, "url": url,
+            "source_url": "https://commons.wikimedia.org/wiki/" + quote_plus(title.replace(" ", "_")),
+            "mime": mime, "size": int(info.get("size", 0) or 0),
+            "license_note": "دسترسی مستقیم فایل بررسی شد؛ مجوز بازنشر باید در صفحه منبع بررسی شود.",
+            "verified_at": now_ts(), "search_query": query,
+        })
+        if len(out) >= limit:
+            break
+    return out
 
 
 def search_images(query: str, limit=5):
-    """Search Wikimedia Commons and return only trusted direct media URLs."""
-    try:
-        r = requests.get("https://commons.wikimedia.org/w/api.php", params={
-            "action": "query", "generator": "search", "gsrsearch": f'filetype:bitmap {query}',
-            "gsrnamespace": 6, "gsrlimit": min(10, max(1, int(limit))), "prop": "imageinfo|info",
-            "iiprop": "url|mime|size", "iiurlwidth": 1200, "inprop": "url", "format": "json",
-        }, headers={"User-Agent": "RaptorV56/1.0 (Telegram content research bot)"}, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        out, seen = [], set()
-        for page in data.get("query", {}).get("pages", {}).values():
-            info = (page.get("imageinfo") or [{}])[0]
-            url = info.get("thumburl") or info.get("url", "")
-            parsed = urlparse(url)
-            if parsed.scheme != "https" or parsed.hostname != "upload.wikimedia.org":
-                continue
-            if info.get("mime") not in {"image/jpeg", "image/png", "image/webp"} or url in seen:
-                continue
-            seen.add(url)
-            # Verify that the direct media URL can be fetched and really returns an image.
-            try:
-                check = requests.get(url, headers={"User-Agent": "RaptorV56/1.0", "Range": "bytes=0-1023"},
-                                     stream=True, timeout=8, allow_redirects=True)
-                final = urlparse(check.url)
-                content_type = str(check.headers.get("Content-Type", "")).lower()
-                length = int(check.headers.get("Content-Length", "0") or 0)
-                accessible = check.status_code in {200, 206} and content_type.startswith("image/") and final.scheme == "https" and final.hostname == "upload.wikimedia.org"
-                if length > MAX_IMAGE_BYTES:
-                    accessible = False
-                check.close()
-            except Exception:
-                accessible = False
-            if not accessible:
-                continue
-            out.append({"title": page.get("title", ""), "url": url,
-                        "source_url": page.get("fullurl", "https://commons.wikimedia.org/wiki/" + quote_plus(page.get("title", ""))),
-                        "mime": info.get("mime"), "size": int(info.get("size", 0) or 0),
-                        "license_note": "دسترسی مستقیم فایل بررسی شد؛ مجوز بازنشر را در صفحه منبع بررسی کنید.", "verified_at": now_ts()})
-            if len(out) >= limit:
-                break
-        return out
-    except Exception as exc:
-        log.warning("Wikimedia image search failed: %s", type(exc).__name__)
+    """Search real, direct Commons images using progressively broader relevant terms."""
+    raw = (query or "").strip()
+    if not raw:
         return []
+    variants = [raw]
+    # A long model-generated query can be too restrictive. Try a compact noun phrase too.
+    compact = " ".join(re.findall(r"[\w\u0600-\u06FF-]+", raw)[:7]).strip()
+    if compact and compact.casefold() != raw.casefold():
+        variants.append(compact)
+    seen, results = set(), []
+    errors = []
+    for variant in variants:
+        try:
+            matches = _commons_search_once(variant, limit)
+            for item in matches:
+                if item.get("url") not in seen:
+                    seen.add(item.get("url"))
+                    results.append(item)
+            if len(results) >= limit:
+                break
+        except Exception as exc:
+            errors.append(type(exc).__name__)
+            log.warning("Wikimedia image search failed for query %r: %s", variant[:80], type(exc).__name__)
+    return results[:max(1, int(limit))]
 
 
 def attach_images(project: dict, limit_per_post=3):
+    """Find relevant candidates and preselect the best verified result for review.
+
+    Selection is not publication approval: posts remain drafts until an admin
+    reviews the image and explicitly approves/schedules the post.
+    """
     total = 0
+    auto_selected = 0
     for post in project.get("posts", []):
-        if post.get("images"):
-            continue
-        matches = search_images(post.get("image_query") or project.get("title", "military"), limit_per_post)
-        existing = {x.get("url") for x in post.get("image_candidates", [])}
-        matches = [x for x in matches if x.get("url") not in existing]
-        post.setdefault("image_candidates", []).extend(matches)
-        post["image_candidates"] = post["image_candidates"][:12]
-        total += len(matches)
+        existing = {x.get("url") for x in post.get("image_candidates", []) if isinstance(x, dict)}
+        queries = [post.get("image_query"), post.get("title"), project.get("title"), project.get("topic")]
+        if len(post.get("image_candidates", [])) < limit_per_post:
+            for query in dict.fromkeys(str(q).strip() for q in queries if str(q or "").strip()):
+                matches = [x for x in search_images(query, limit_per_post)
+                           if x.get("url") and x.get("url") not in existing]
+                post.setdefault("image_candidates", []).extend(matches)
+                existing.update(x.get("url") for x in matches)
+                if len(post["image_candidates"]) >= limit_per_post:
+                    break
+        post["image_candidates"] = post.get("image_candidates", [])[:12]
+        # The first query is generated for the specific post, so the first
+        # accessible match is the default choice. Preserve manual selections.
+        if not post.get("images") and post.get("image_candidates"):
+            chosen = copy.deepcopy(post["image_candidates"][0])
+            chosen["auto_selected"] = True
+            chosen["selection_note"] = "انتخاب اولیه خودکار بر اساس عبارت تصویر همین پست؛ پیش از انتشار بازبینی شود."
+            post["images"] = [chosen]
+            post["image_auto_selected"] = True
+            auto_selected += 1
+        total += len(post.get("image_candidates", []))
     project["updated_at"] = now_ts()
-    _append_history(project, "images_searched", f"new_candidates={total}")
+    _append_history(project, "images_searched", f"candidate_total={total}; auto_selected={auto_selected}")
     return total
 
 
