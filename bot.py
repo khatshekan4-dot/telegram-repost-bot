@@ -4594,7 +4594,7 @@ def admin_answer_callback(callback_id, text=""):
         pass
 
 
-def admin_show_menu(chat_id, message_id=None, role="observer"):
+def admin_show_menu(chat_id, message_id=None, role="observer", state=None):
     if role == "observer":
         rows = [
             [admin_button("📊 آمار و وضعیت ربات", "stats")],
@@ -4605,12 +4605,13 @@ def admin_show_menu(chat_id, message_id=None, role="observer"):
             [admin_button("🩺 عیب‌یابی", "diagnose")],
         ]
     else:
+        state = state if isinstance(state, dict) else {}
+        news_enabled = bool(state.get("_news_engine_enabled", True))
         rows = [
             [admin_button("📊 آمار و وضعیت ربات", "stats"), admin_button("⚙️ تنظیمات ربات", "settings")],
             [admin_button("📰 مدیریت اخبار", "news"), admin_button("📡 مدیریت منابع", "sources")],
             [admin_button("🤖 مدیریت هوش مصنوعی", "ai")],
         ]
-        news_enabled = bool(state.get("_news_engine_enabled", True))
         rows.extend([
             [admin_button("📚 محتوای تحلیلی", "analytics")],
             [admin_button("⏸ خاموش‌کردن موتور اخبار" if news_enabled else "▶️ روشن‌کردن موتور اخبار", "newsengine")],
@@ -4618,7 +4619,8 @@ def admin_show_menu(chat_id, message_id=None, role="observer"):
         ])
     if role == "owner":
         rows.append([admin_button("👥 مدیریت ادمین‌ها", "admins")])
-    admin_render(chat_id, f"🦅 پنل مدیریت رپتور — نسخه {BOT_VERSION}\nموتور اخبار: {'فعال' if state.get('_news_engine_enabled', True) else 'متوقف'}\nیک بخش را انتخاب کن:", rows, message_id)
+    news_enabled = bool(state.get("_news_engine_enabled", True)) if isinstance(state, dict) else True
+    admin_render(chat_id, f"🦅 پنل مدیریت رپتور — نسخه {BOT_VERSION}\nموتور اخبار: {'فعال' if news_enabled else 'متوقف'}\nیک بخش را انتخاب کن:", rows, message_id)
 
 
 def render_stats(state, chat_id, message_id=None):
@@ -5313,12 +5315,12 @@ def handle_admin_text(state, user_id, chat_id, text):
     text = str(text or "").strip()
     if text == "/cancel":
         clear_admin_session(state, user_id)
-        admin_show_menu(chat_id, role=admin_role(state, user_id))
+        admin_show_menu(chat_id, role=admin_role(state, user_id), state=state)
         return
     session = state.get("_admin_sessions", {}).get(str(user_id))
     if not session:
         if text.startswith("/admin"):
-            admin_show_menu(chat_id, role=admin_role(state, user_id))
+            admin_show_menu(chat_id, role=admin_role(state, user_id), state=state)
         elif text.startswith("/find"):
             bits = text.split(maxsplit=1)
             if len(bits) != 2 or not bits[1].strip().isdigit():
@@ -6654,7 +6656,7 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
         save_state(state)
         record_admin_activity(state, user_id, "تغییر وضعیت موتور اخبار", "فعال" if enabled else "متوقف")
         log.warning("News engine manually %s by admin %s", "enabled" if enabled else "paused", user_id)
-        admin_show_menu(chat_id, message_id, role)
+        admin_show_menu(chat_id, message_id, role, state=state)
     elif action == "analytics":
         analytics_menu(state, chat_id, message_id)
     elif action in {"anewresearch", "anewtext", "anewfile"}:
@@ -7224,7 +7226,7 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
         render_modes_settings(state, chat_id, message_id)
     elif action == "v53":
         # Legacy callback compatibility: V5.3 controls have been redistributed.
-        admin_show_menu(chat_id, message_id, role)
+        admin_show_menu(chat_id, message_id, role, state=state)
     elif action == "pause" and len(parts) > 1:
         pause_mode = parts[1]
         if pause_mode == "1h":
@@ -7396,7 +7398,7 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
             admin_render(chat_id, "\n".join(lines), [[admin_button("⬅️ بازگشت به خبر", f"q|{parts[1]}")]], message_id)
     elif action == "menu":
         clear_admin_session(state, user_id)
-        admin_show_menu(chat_id, message_id, role)
+        admin_show_menu(chat_id, message_id, role, state=state)
     elif action == "stats": render_stats(state, chat_id, message_id)
     elif action == "settings": render_settings(state, chat_id, message_id)
     elif action == "setting" and len(parts) > 1:
@@ -7742,7 +7744,7 @@ def _handle_admin_update_unlocked(state, update):
         return
     if text.startswith("/admin"):
         clear_admin_session(state, user_id)
-        admin_show_menu(chat_id, role=role)
+        admin_show_menu(chat_id, role=role, state=state)
     else:
         handle_admin_text(state, user_id, chat_id, text)
     save_state(state)
@@ -7761,7 +7763,7 @@ def handle_admin_update(state, update):
         role = admin_role(state, user_id)
         if user_id and chat_id is not None and role:
             clear_admin_session(state, user_id)
-            admin_show_menu(chat_id, role=role)
+            admin_show_menu(chat_id, role=role, state=state)
             return
     # Other state-changing panel operations remain serialized.
     with STATE_LOCK:
