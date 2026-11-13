@@ -13,6 +13,7 @@ import io
 import copy
 import uuid
 import analytics as analytics_v55
+import analytical_style as analytical_style_v591
 import reliability as reliability_v58
 from datetime import datetime, timezone, timedelta
 
@@ -279,7 +280,7 @@ STATE_IO_LOCK = threading.RLock()
 STATE_LOCK = threading.RLock()
 # Wake the main worker as soon as an analytical job enters the durable queue.
 ANALYTICS_WAKE_EVENT = threading.Event()
-BOT_VERSION = "5.9"
+BOT_VERSION = "5.91"
 CHEAP_CLASSIFIER_ENABLED = os.environ.get("CHEAP_CLASSIFIER_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 CHEAP_CLASSIFIER_MODEL = os.environ.get("CHEAP_CLASSIFIER_MODEL", "openai/gpt-oss-20b").strip()
 TGSTAT_API_TOKEN = os.environ.get("TGSTAT_API_TOKEN", "").strip()
@@ -292,7 +293,7 @@ MAX_ADMIN_LOGS = 100
 
 HTTP_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (compatible; RaptorNewsBot/5.9; "
+        "Mozilla/5.0 (compatible; RaptorNewsBot/5.91; "
         "+https://t.me/khaatshekaan)"
     )
 }
@@ -5332,7 +5333,28 @@ def handle_admin_text(state, user_id, chat_id, text):
         return
     mode = session.get("type")
     try:
-        if mode == "analytics_timezone_input":
+        if mode == "analytics_style_input":
+            if not text.strip():
+                raise ValueError("دستورالعمل خالی است؛ برای پاک‌کردن از دکمه بازنشانی استفاده کن.")
+            if len(text) > analytical_style_v591.MAX_CUSTOM_INSTRUCTIONS:
+                raise ValueError(f"حداکثر طول دستور اختصاصی {analytical_style_v591.MAX_CUSTOM_INSTRUCTIONS} نویسه است.")
+            st = analytics_v55.ensure_state(state)["settings"]
+            st["custom_writing_instructions"] = text.strip()
+            st["style_profile_version"] = analytical_style_v591.STYLE_VERSION
+            analytics_save(state); clear_admin_session(state, user_id)
+            analytics_style_menu(state, chat_id)
+        elif mode == "analytics_post_count_input":
+            if text not in {"5", "6", "۵", "۶"}:
+                raise ValueError("تعداد هدف فقط می‌تواند ۵ یا ۶ باشد.")
+            project = analytics_v55.ensure_state(state)["projects"].get(session.get("project_id"))
+            if not project:
+                raise ValueError("پروژه پیدا نشد.")
+            project["target_post_count"] = 5 if text in {"5", "۵"} else 6
+            project["updated_at"] = now_ts()
+            analytics_v55._append_history(project, "post_target_changed", str(project["target_post_count"]), user_id)
+            analytics_save(state); clear_admin_session(state, user_id)
+            analytics_open(state, chat_id, project["id"])
+        elif mode == "analytics_timezone_input":
             try:
                 ZoneInfo(text)
             except Exception:
@@ -5436,7 +5458,23 @@ def handle_admin_text(state, user_id, chat_id, text):
             try: dt = datetime.strptime(text, "%Y-%m-%d %H:%M").replace(tzinfo=tz)
             except ValueError: raise ValueError("قالب زمان نامعتبر است؛ نمونه: 2026-10-21 16:30")
             if dt.timestamp() <= now_ts(): raise ValueError("زمان باید در آینده باشد.")
-            analytics_v55.manual_schedule_single(state, project, post, dt.timestamp(), tz)
+            try:
+                analytics_v55.manual_schedule_single(state, project, post, dt.timestamp(), tz)
+            except analytics_v55.AnalyticsError as exc:
+                alternatives = analytics_v55.suggest_manual_schedule_times(
+                    state, project, post, dt.timestamp(), tz, limit=5, days=7
+                )
+                clear_admin_session(state, user_id)
+                if alternatives:
+                    buttons = []
+                    for stamp in alternatives:
+                        label = datetime.fromtimestamp(stamp, tz).strftime("%Y-%m-%d %H:%M")
+                        buttons.append([admin_button("⏱ " + label, f"asinglechoose|{project['id']}|{post['id']}|{int(stamp)}")])
+                    buttons.append([admin_button("بازگشت به پست", f"apost|{project['id']}|{post['id']}")])
+                    admin_render(chat_id, "زمان انتخابی قابل ثبت نیست: " + sanitize_error_text(exc) +
+                                 "\n\nزمان‌های جایگزین معتبر:", buttons)
+                    return
+                raise
             analytics_save(state); clear_admin_session(state, user_id)
             analytics_show_post(state, chat_id, project["id"], post["id"])
         elif mode == "analytics_post_edit_text":
@@ -5537,10 +5575,10 @@ def handle_admin_text(state, user_id, chat_id, text):
             clear_admin_session(state, user_id)
             admin_render(chat_id,
                 "📥 موضوع ثبت شد و در صف پایدار تحقیق قرار گرفت.\n"
-                "ربات به‌صورت خودکار با هرکدام از Gemini، Groq یا Mistral که فعال و در دسترس باشد کار می‌کند؛ "
-                "ابتدا وب را جست‌وجو می‌کند، مقاله تحلیلی می‌سازد، آن را به پیش‌نویس‌های مستقل تبدیل می‌کند و برای هر پست تصویر مرتبط پیدا می‌کند.\n"
+                "ربات به‌صورت خودکار با هرکدام از Gemini، Groq یا Mistral که فعال و در دسترس باشد تحقیق می‌کند؛ ابتدا وب را جست‌وجو می‌کند و مقاله و منابع را برای بازبینی تو آماده می‌سازد.\n"
+                "تا زمانی که مقاله را تأیید نکنی، پست تلگرامی ساخته نمی‌شود. پس از تأیید مقاله، ربات آن را به پیش‌نویس‌های مستقل تبدیل می‌کند و برای هر پست تصویر مرتبط می‌یابد.\n"
                 "اگر جست‌وجو یا همه موتورهای هوش مصنوعی موقتاً قطع باشند، همین موضوع در صف می‌ماند و خودکار دوباره تلاش می‌شود؛ نیازی به ارسال مجدد نیست.\n"
-                "هیچ پستی بدون بازبینی و تأیید مدیر منتشر نخواهد شد.",
+                "هیچ پستی بدون بازبینی و تأیید جداگانه مدیر منتشر نخواهد شد.",
                 [[admin_button("مشاهده وضعیت پروژه", "aopen|" + project["id"])],
                  [admin_button("مشاهده صف پروژه‌ها", "alist|all")],
                  [admin_button("محتوای تحلیلی", "analytics")]])
@@ -5561,7 +5599,7 @@ def handle_admin_text(state, user_id, chat_id, text):
                     return
                 project["status"]="error"; project["last_error"]=sanitize_error_text(exc); project.setdefault("errors",[]).append({"at":now_ts(),"error":project["last_error"]}); project.pop("_ai_runtime", None); analytics_save(state); clear_admin_session(state,user_id)
                 admin_render(chat_id,"❌ تبدیل متن ناموفق بود؛ پروژه و متن ورودی ذخیره شد و منتشر نمی‌شود.\n"+project["last_error"],
-                             [[admin_button("تلاش دوباره با Gemini", "aregenerate|" + project["id"])],
+                             [[admin_button("تلاش مجدد با موتورهای فعال", "aregenerate|" + project["id"])],
                               [admin_button("درخواست جایگزین Groq", "afallbackposts|" + project["id"] + "|groq"), admin_button("درخواست جایگزین Mistral", "afallbackposts|" + project["id"] + "|mistral")],
                               [admin_button("پروژه‌ها","alist|all")],[admin_button("منوی تحلیلی","analytics")]])
         elif mode == "edit_text":
@@ -5949,13 +5987,15 @@ def analytics_menu(state, chat_id, message_id=None):
     metrics = analytics_v55.render_metrics(state)
     settings = a["settings"]
     rows = [
-        [admin_button("🔎 تحقیق هوشمند با Gemini", "anewresearch"), admin_button("📝 تبدیل متن", "anewtext")],
+        [admin_button("🔎 تحقیق هوشمند از موضوع", "anewresearch"), admin_button("📝 تبدیل متن", "anewtext")],
         [admin_button("📄 ورود متن از فایل", "anewfile"), admin_button("🔍 جست‌وجوی پروژه", "asearch")],
         [admin_button(f"📂 همه پروژه‌ها ({metrics['projects']})", "alist|all"), admin_button("📝 پیش‌نویس‌ها", "alist|draft")],
         [admin_button("✅ آماده بازبینی", "alist|review"), admin_button("🗓 تقویم انتشار", "acalendar")],
-        [admin_button("🕒 صف زمان‌بندی‌شده", "alist|scheduled"), admin_button("📤 منتشرشده‌ها", "alist|published")],
-        [admin_button("🖼 گالری تصاویر پروژه‌ها", "agallery"), admin_button("📊 گزارش عملکرد", "areport")],
+        [admin_button("📥 صف انتشار تحلیلی", "alist|queue"), admin_button("🕒 زمان‌بندی‌شده", "alist|scheduled")],
+        [admin_button("📤 منتشرشده‌ها", "alist|published"), admin_button("🖼 گالری تصاویر", "agallery")],
+        [admin_button("📊 گزارش عملکرد", "areport")],
         [admin_button("⏸ توقف صف تحلیلی" if not settings.get("paused") else "▶️ ادامه صف تحلیلی", "apaus" if not settings.get("paused") else "aresume"), admin_button("⚙️ تنظیمات", "asettings")],
+        [admin_button("✍️ سبک و دستورالعمل نگارش", "astyle")],
         [admin_button("🏠 منوی اصلی", "menu")],
     ]
     paused = "متوقف" if settings.get("paused") else "فعال"
@@ -5965,6 +6005,26 @@ def analytics_menu(state, chat_id, message_id=None):
             f"فاقد تصویر: {metrics['images_missing']} | نیازمند بررسی/خطا: {metrics['draft'] + metrics['failed_or_uncertain']}\n"
             f"صف تحلیلی: {paused} | کارهای AI در انتظار: {waiting_ai} | منطقه زمانی: {settings.get('timezone', 'Asia/Tehran')}\n"
             f"بازه: {settings.get('start_hour',14):02d}:00 تا {settings.get('end_hour',21):02d}:00 | حالت: {settings.get('schedule_mode','auto')}")
+    admin_render(chat_id, text, rows, message_id)
+
+
+def analytics_style_menu(state, chat_id, message_id=None):
+    st = analytics_v55.ensure_state(state)["settings"]
+    custom = str(st.get("custom_writing_instructions", ""))
+    text = (
+        "✍️ مدیریت سبک نگارش محتوای تحلیلی\n\n"
+        "پروفایل ثابت V5.91 برای همه مدل‌ها فعال است: Gemini، Groq و Mistral دستورالعمل یکسان می‌گیرند.\n"
+        "کنترل خودکار واژگان ترجیحی، عبارت‌های کلیشه‌ای، گیومه/پرانتز، پیوند و بخش منابع اجرا می‌شود.\n"
+        f"بازبینی ثانویه هوش مصنوعی: {'فعال' if st.get('style_quality_review', True) else 'غیرفعال'}\n"
+        f"دستور اختصاصی مدیر: {'ثبت شده' if custom else 'ثبت نشده'} | {len(custom)} نویسه\n\n"
+        "برای تغییر سبک، دستورهای خودت را یک‌بار اینجا ثبت کن؛ از آن پس در تحقیق، تبدیل متن، بازنویسی و کنترل کیفیت استفاده می‌شوند."
+    )
+    rows = [
+        [admin_button("📝 ویرایش دستورالعمل اختصاصی", "astyleedit")],
+        [admin_button("👁 مشاهده قواعد ثابت سبک", "astyleview")],
+        [admin_button("🧹 حذف دستور اختصاصی و بازگشت به پیش‌فرض", "astyleclear")],
+        [admin_button("⚙️ تنظیمات تحلیلی", "asettings"), admin_button("بازگشت", "analytics")],
+    ]
     admin_render(chat_id, text, rows, message_id)
 
 
@@ -5979,6 +6039,8 @@ def analytics_list(state, chat_id, message_id=None, mode="all", search="", page=
         projects = [p for p in projects if p.get("status") in {"review_research", "review_posts", "needs_review", "error"}]
     elif mode == "scheduled":
         projects = [p for p in projects if any(x.get("status") == "scheduled" for x in p.get("posts", []))]
+    elif mode == "queue":
+        projects = [p for p in projects if any(x.get("status") in {"approved", "scheduled"} for x in p.get("posts", []))]
     elif mode == "published":
         projects = [p for p in projects if any(x.get("status") == "published" for x in p.get("posts", []))]
     elif mode == "error":
@@ -6016,7 +6078,8 @@ def analytics_list(state, chat_id, message_id=None, mode="all", search="", page=
     if nav: rows.append(nav)
     rows.extend([
         [admin_button("همه", "alist|all"), admin_button("پیش‌نویس", "alist|draft"), admin_button("بازبینی", "alist|review")],
-        [admin_button("زمان‌بندی", "alist|scheduled"), admin_button("منتشرشده", "alist|published"), admin_button("خطا", "alist|error")],
+        [admin_button("صف انتشار", "alist|queue"), admin_button("زمان‌بندی", "alist|scheduled"), admin_button("منتشرشده", "alist|published")],
+        [admin_button("خطا", "alist|error")],
         [admin_button("مرتب‌سازی: ایجاد", f"alist|{mode}|0|created"), admin_button("عنوان", f"alist|{mode}|0|title")],
         [admin_button("انتشار بعدی", f"alist|{mode}|0|next"), admin_button("وضعیت", f"alist|{mode}|0|status")],
         [admin_button("جست‌وجو", "asearch"), admin_button("تقویم", "acalendar"), admin_button("بازگشت", "analytics")],
@@ -6130,6 +6193,7 @@ def analytics_open(state, chat_id, pid, message_id=None):
         rows.append([admin_button(f"پست {post.get('number')} · {post.get('status')} · عکس {len(post.get('images',[]))}", "apost|" + pid + "|" + post["id"])])
     rows.extend([
         [admin_button("🖼 گالری تصاویر", "agallery|" + pid), admin_button("➕ افزودن تصاویر", "aaddprojimg|" + pid)],
+        [admin_button(f"تعداد هدف پست‌ها: {p.get('target_post_count', 6)} (۵ یا ۶)", "apostcount|" + pid)],
         [admin_button("✅ تأیید همه پست‌ها", "apostapprove|" + pid), admin_button("🗓 زمان‌بندی خودکار", "aschedule|" + pid)],
         [admin_button("🕒 زمان‌بندی دستی", "amanual|" + pid), admin_button("🗓 تقویم", "acalendar")],
         [admin_button(("▶️ ادامه پروژه" if p.get("paused") else "⏸ توقف پروژه"), "aprojecttoggle|" + pid)],
@@ -6164,7 +6228,8 @@ def analytics_show_sources(state, chat_id, pid, message_id=None):
     sources = p.get("sources", [])
     lines = [f"🔗 منابع بازبینی مدیر — {len(sources)} مورد"]
     for i, src in enumerate(sources[:15], 1):
-        lines.append(f"{i}. {src.get('title','بدون عنوان')}\n{src.get('url','')}\nوضعیت: {src.get('status','نیازمند بررسی')}\n{src.get('snippet','')[:180]}")
+        excerpt = src.get("content_excerpt") or src.get("snippet", "")
+        lines.append(f"{i}. {src.get('title','بدون عنوان')}\n{src.get('url','')}\nوضعیت بررسی: {src.get('status','نیازمند بررسی')} | دریافت صفحه: {src.get('fetch_status','نامشخص')}\n{excerpt[:420]}")
     admin_render(chat_id, "\n\n".join(lines)[:3800], [[admin_button("بازگشت به پروژه", "aopen|" + pid)]], message_id)
 
 
@@ -6211,6 +6276,7 @@ def analytics_show_post(state, chat_id, pid, postid, message_id=None, user_id=No
             [admin_button("🔎 جست‌وجوی دوباره تصویر", f"aimages|{pid}"), admin_button("➕ افزودن عکس مستقیم", f"aaddimg|{pid}|{postid}")],
             [admin_button("🔀 جابه‌جایی دو تصویر اول", f"aimgswap|{pid}|{postid}"), admin_button("اجازه بدون عکس: " + ("روشن" if post.get("allow_no_image") else "خاموش"), f"aimagepolicy|{pid}|{postid}")],
             [admin_button("✅ تأیید این پست", f"aapprovepost|{pid}|{postid}"), admin_button("↩️ پیش‌نویس", f"adraftpost|{pid}|{postid}")],
+            [admin_button("🗑 حذف پست…", f"apostdeleteprompt|{pid}|{postid}"), admin_button("رد کردن", f"arejectpost|{pid}|{postid}")],
             [admin_button("🕒 تغییر زمان", f"asingle|{pid}|{postid}"), admin_button("لغو زمان‌بندی", f"aunschedule|{pid}|{postid}")],
             [admin_button("📤 انتشار فوری…", f"apublishprompt|{pid}|{postid}")],
             [admin_button(selected_mark, f"abulktoggle|{pid}|{postid}"), admin_button("عملیات گروهی", "abulk")],
@@ -6397,6 +6463,8 @@ def analytics_apply_ai_runtime(state, project):
             project["ai_provider_override"] = order[0]
     # The user explicitly requested provider-agnostic automatic work. Failover is
     # therefore always enabled for normal research/conversion tasks.
+    project["_style_custom_instructions"] = str(st.get("custom_writing_instructions", ""))[:analytical_style_v591.MAX_CUSTOM_INSTRUCTIONS]
+    project["_style_quality_review"] = bool(st.get("style_quality_review", True))
     project["_ai_runtime"] = {
         "auto_failover": True,
         "provider_order": list(order),
@@ -6490,22 +6558,18 @@ def analytics_process_ai_queue(state):
     project["status"] = "researching" if task.get("operation") == "research" else "converting"
     analytics_save(state)
     try:
-        if task.get("operation") == "research":
+        completed_operation = str(task.get("operation"))
+        if completed_operation == "research":
             analytics_v55.research_project(project)
-            # Persist the completed article before the next AI/image stage. If a
-            # provider becomes unavailable during splitting, resume from the article.
+            # Research is a separate approval gate. Do not split into Telegram posts
+            # or search post images until the manager explicitly approves the article.
+            project["approved_article"] = False
+            project["approved_posts"] = False
+            project["status"] = "review_research"
             analytics_save(state)
-            try:
-                analytics_v55.split_into_posts(project)
-                analytics_v55.attach_images(project)
-                project["research_auto_pipeline_completed"] = True
-                project["approved_article"] = False
-                project["approved_posts"] = False
-            except analytics_v55.AIUnavailableError:
-                task["operation"] = "split"
-                analytics_save(state)
-                raise
-        elif task.get("operation") == "split":
+        elif completed_operation == "split":
+            if project.get("kind") == "research" and not project.get("approved_article"):
+                raise analytics_v55.AnalyticsError("مقاله تحقیقاتی هنوز به تأیید مدیر نرسیده است؛ تولید پست مسدود شد.")
             analytics_v55.split_into_posts(project)
             analytics_v55.attach_images(project)
         else:
@@ -6522,14 +6586,23 @@ def analytics_process_ai_queue(state):
         if task.get("owner_id"):
             try:
                 owner_chat = int(task.get("owner_id"))
-                admin_render(owner_chat,
-                    "✅ پردازش خودکار محتوای تحلیلی کامل شد.\n"
-                    f"موضوع: {project.get('title', 'بدون عنوان')}\n"
-                    f"منابع: {len(project.get('sources', []))} | پیش‌نویس‌ها: {len(project.get('posts', []))}\n"
-                    f"تصویرهای پیشنهادی: {sum(len(x.get('image_candidates', [])) for x in project.get('posts', []))}\n"
-                    f"موتور تحقیق: {analytics_provider_display(project.get('research_ai_provider'))}\n"
-                    f"موتور تولید پست: {analytics_provider_display(project.get('posts_ai_provider'))}\n"
-                    "مقاله، پست‌ها و گزینه‌های تصویر ذخیره شده‌اند؛ برای انتشار همچنان تأیید مدیر لازم است.",
+                if completed_operation == "research":
+                    notice = (
+                        "✅ تحقیق موضوع تکمیل شد و مقاله برای بازبینی آماده است.\n"
+                        f"موضوع: {project.get('title', 'بدون عنوان')}\n"
+                        f"منابع ثبت‌شده: {len(project.get('sources', []))}\n"
+                        f"موتور تحقیق: {analytics_provider_display(project.get('research_ai_provider'))}\n"
+                        "هنوز هیچ پست تلگرامی ساخته یا منتشر نشده است. پس از بررسی مقاله و منابع، دکمه «تأیید مقاله و تولید پست‌ها» را بزن."
+                    )
+                else:
+                    notice = (
+                        "✅ تولید پست‌های تحلیلی کامل شد.\n"
+                        f"موضوع: {project.get('title', 'بدون عنوان')}\n"
+                        f"پیش‌نویس‌ها: {len(project.get('posts', []))} | تصاویر پیشنهادی: {sum(len(x.get('image_candidates', [])) for x in project.get('posts', []))}\n"
+                        f"موتور تولید پست: {analytics_provider_display(project.get('posts_ai_provider'))}\n"
+                        "پست‌ها برای بازبینی مدیر آماده‌اند؛ انتشار بدون تأیید جداگانه انجام نمی‌شود."
+                    )
+                admin_render(owner_chat, notice,
                     [[admin_button("📁 باز کردن پروژه", "aopen|" + project["id"])],
                      [admin_button("📚 محتوای تحلیلی", "analytics")]])
             except Exception as notify_exc:
@@ -6614,7 +6687,7 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
     admin_answer_callback(callback.get("id", ""))
 
     area_by_action = {
-        "menu": "stats", "stats": "stats", "newsengine": "settings", "analytics": "analytics", "anewresearch": "analytics", "anewtext": "analytics", "alist": "analytics", "aopen": "analytics", "aarticle": "analytics", "aresearchok": "analytics", "areject": "analytics", "apost": "analytics", "aposts": "analytics", "apostapprove": "analytics", "aschedule": "analytics", "apaus": "analytics", "aresume": "analytics", "asources": "analytics", "aimages": "analytics", "aimage": "analytics", "aapprove": "analytics", "acancel": "analytics", "asettings": "analytics", "aaddimg": "analytics", "amanual": "analytics", "atimezone": "analytics", "aslot": "analytics", "amode": "analytics", "aimagereq": "analytics", "settings": "settings", "setting": "settings", "setprompt": "settings",
+        "menu": "stats", "stats": "stats", "newsengine": "settings", "analytics": "analytics", "astyle": "analytics", "astyleedit": "analytics", "astyleview": "analytics", "astyleclear": "analytics", "anewresearch": "analytics", "anewtext": "analytics", "alist": "analytics", "aopen": "analytics", "aarticle": "analytics", "aresearchok": "analytics", "areject": "analytics", "apost": "analytics", "aposts": "analytics", "apostapprove": "analytics", "aschedule": "analytics", "apaus": "analytics", "aresume": "analytics", "asources": "analytics", "aimages": "analytics", "aimage": "analytics", "aapprove": "analytics", "acancel": "analytics", "asettings": "analytics", "aaddimg": "analytics", "apostcount": "analytics", "amanual": "analytics", "atimezone": "analytics", "aslot": "analytics", "amode": "analytics", "aimagereq": "analytics", "settings": "settings", "setting": "settings", "setprompt": "settings",
         "news": "history_view" if role == "observer" else "news", "queue": "queue", "queuepage": "queue",
         "q": "queue", "qedit": "queue", "qimg": "queue", "qdelay": "queue", "qpub": "queue", "qdel": "queue",
         "history": "history_view" if role == "observer" else "news", "historypage": "history_view" if role == "observer" else "news", "h": "history_view" if role == "observer" else "news",
@@ -6631,9 +6704,9 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
     }
     area_by_action.update({name: "analytics" for name in (
         "anewfile", "asearch", "acalendar", "areport", "agallery", "aaddprojimg", "agprev",
-        "aresearchupdate", "aresearchretry", "afallbackresearch", "aarticleapprove", "aregenprompt", "aregenerate",
-        "aapprovepost", "adraftpost", "arejectpost", "apreview", "apostversions", "aassignimg", "aeditpost", "arewrite", "abulkclear", "aeditarticle", "aedittitle", "arewritecustom", "aimagequery", "aimgup", "aimgdown", "afallbackposts", "afallbackrewrite", "afallbackaddendum",
-        "aremoveimg", "aimgswap", "aimagepolicy", "asingle", "aunschedule", "apublishprompt",
+        "aresearchupdate", "aresearchretry", "afallbackresearch", "aarticleapprove", "astyle", "astyleedit", "astyleview", "astyleclear", "aregenprompt", "aregenerate",
+        "aapprovepost", "adraftpost", "apostcount", "arejectpost", "apostdeleteprompt", "apostdeleteconfirm", "apreview", "apostversions", "aassignimg", "aeditpost", "arewrite", "abulkclear", "aeditarticle", "aedittitle", "arewritecustom", "aimagequery", "aimgup", "aimgdown", "afallbackposts", "afallbackrewrite", "afallbackaddendum",
+        "aremoveimg", "aimgswap", "aimagepolicy", "asingle", "asinglechoose", "aunschedule", "apublishprompt",
         "apublishnow", "acancelprompt", "aarchiveprompt", "aarchive", "abulk", "abulktoggle", "aifailover", "aiqueue", "aifailover", "aiqueue",
         "abulkapprove", "abulkdraft", "abulkreject", "abulkcancelprompt", "abulkcancelconfirm", "abulkschedule", "abulkshift", "abulkprojecttoggle", "aprojecttoggle",
         "abulkarchiveprompt", "abulkarchiveconfirm", "aprojecthistory",
@@ -6697,6 +6770,14 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
         else: analytics_gallery(state, chat_id, message_id)
     elif action == "aopen" and len(parts) > 1:
         analytics_open(state, chat_id, parts[1], message_id)
+    elif action == "apostcount" and len(parts) > 1:
+        project = analytics_v55.ensure_state(state)["projects"].get(parts[1])
+        if not project:
+            admin_render(chat_id, "پروژه پیدا نشد.", [[admin_button("پروژه‌ها", "alist|all")]], message_id)
+        else:
+            ask_admin_input(state, user_id, chat_id,
+                            {"type": "analytics_post_count_input", "project_id": parts[1]},
+                            "تعداد هدف این پروژه را وارد کن: ۵ یا ۶. اگر منبع واقعاً ناکافی باشد، سامانه می‌تواند با ثبت علت تعداد کمتری تولید کند.", message_id)
     elif action == "aarticle" and len(parts) > 1:
         analytics_show_article(state, chat_id, parts[1], safe_int(parts[2], 0) if len(parts) > 2 else 0, message_id)
     elif action == "asources" and len(parts) > 1:
@@ -6705,46 +6786,46 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
         project = analytics_v55.ensure_state(state)["projects"].get(parts[1])
         if not project or not project.get("article"):
             admin_render(chat_id, "مقاله برای تأیید پیدا نشد.", [[admin_button("پروژه‌ها", "alist|all")]], message_id)
-        else:
+        elif project.get("posts"):
             project["approved_article"] = True
-            analytics_v55._append_history(project, "article_approved", "مقاله پس از تولید خودکار پیش‌نویس‌ها تأیید شد.", user_id)
+            analytics_v55._append_history(project, "article_approved", "مقاله تحقیقاتی توسط مدیر تأیید شد.", user_id)
             analytics_save(state)
             analytics_open(state, chat_id, parts[1], message_id)
+        else:
+            project["approved_article"] = True
+            analytics_v55._append_history(project, "article_approved", "مقاله تحقیقاتی توسط مدیر تأیید شد؛ تولید پست در صف پایدار قرار گرفت.", user_id)
+            analytics_queue_task(state, project, "split", user_id, "مقاله تأیید شد؛ در انتظار تولید پست و تصویر.")
+            admin_render(chat_id, "✅ مقاله تأیید شد. تولید پست‌ها و جست‌وجوی تصاویر در صف پایدار قرار گرفت؛ در صورت قطعی سرویس، کار از همین مرحله ادامه می‌یابد.",
+                         [[admin_button("مشاهده پروژه", "aopen|" + parts[1])], [admin_button("صف پروژه‌ها", "alist|all")]], message_id)
     elif action == "aresearchok" and len(parts) > 1:
         a = analytics_v55.ensure_state(state); p = a["projects"].get(parts[1])
         if not p or not p.get("article"):
             admin_render(chat_id, "مقاله‌ای برای تأیید وجود ندارد.", [[admin_button("پروژه‌ها", "alist|all")]], message_id)
+        elif p.get("approved_article") and any(t.get("project_id") == p.get("id") and t.get("operation") == "split" and t.get("status") in {"queued", "processing"} for t in a.get("ai_queue", [])):
+            admin_render(chat_id, "تولید پست‌ها قبلاً در صف قرار گرفته است.", [[admin_button("مشاهده پروژه", "aopen|" + parts[1])]], message_id)
         else:
-            try:
-                analytics_apply_ai_runtime(state, p)
-                analytics_v55.split_into_posts(p)
-                analytics_v55.attach_images(p)
-                p.pop("_ai_runtime", None)
-                p["approved_article"] = True
-                analytics_save(state)
-                analytics_open(state, chat_id, parts[1], message_id)
-            except Exception as exc:
-                p["status"] = "error"; p["last_error"] = sanitize_error_text(exc)
-                p.setdefault("errors", []).append({"at": now_ts(), "error": p["last_error"]})
-                analytics_save(state)
-                admin_render(chat_id, "تبدیل مقاله به پست ناموفق بود؛ پروژه حفظ شد و چیزی منتشر نشد.\n" + p["last_error"],
-                             [[admin_button("تلاش دوباره با Gemini", "aresearchok|" + parts[1])],
-                              [admin_button("درخواست جایگزین Groq برای تولید پست", "afallbackposts|" + parts[1] + "|groq")],
-                              [admin_button("درخواست جایگزین Mistral برای تولید پست", "afallbackposts|" + parts[1] + "|mistral")],
-                              [admin_button("بازگشت به پروژه", "aopen|" + parts[1])]], message_id)
+            p["approved_article"] = True
+            analytics_v55._append_history(p, "article_approved", "مقاله تحقیقاتی توسط مدیر تأیید شد؛ تولید پست در صف پایدار قرار گرفت.", user_id)
+            analytics_queue_task(state, p, "split", user_id, "مقاله تأیید شد؛ در انتظار تولید پست و تصویر.")
+            admin_render(chat_id, "✅ مقاله تأیید شد. تولید پست‌ها و تصاویر در صف پایدار قرار گرفت؛ هیچ پستی پیش از تأیید جداگانه منتشر نمی‌شود.",
+                         [[admin_button("مشاهده پروژه", "aopen|" + parts[1])], [admin_button("صف پروژه‌ها", "alist|all")]], message_id)
     elif action == "aresearchupdate" and len(parts) > 1:
         p = analytics_v55.ensure_state(state)["projects"].get(parts[1])
         if not p: admin_render(chat_id, "پروژه پیدا نشد.", [[admin_button("پروژه‌ها", "alist|all")]], message_id)
         else: ask_admin_input(state, user_id, chat_id, {"type": "analytics_research_addendum", "project_id": parts[1]}, "بخش موردنیاز برای تکمیل تحقیق را بنویس؛ جست‌وجوی واقعی و Gemini به کار می‌رود. مقاله قبلی نسخه‌بندی می‌شود.", message_id)
     elif action == "aresearchretry" and len(parts) > 1:
-        p = analytics_v55.ensure_state(state)["projects"].get(parts[1])
+        a = analytics_v55.ensure_state(state); p = a["projects"].get(parts[1])
         try:
             if not p: raise RuntimeError("پروژه پیدا نشد.")
+            failed_tasks = [x for x in a.get("ai_queue", []) if x.get("project_id") == p.get("id") and x.get("status") == "failed"]
+            operation = failed_tasks[-1].get("operation") if failed_tasks else ("split" if p.get("article") and p.get("approved_article") else "research")
+            if operation == "split" and p.get("kind") == "research" and not p.get("approved_article"):
+                raise RuntimeError("مقاله هنوز تأیید نشده است؛ ابتدا مقاله را تأیید کن.")
             p["ai_provider_override_manual"] = False
             p["status"] = "queued_ai"
-            task = analytics_queue_task(state, p, "research", user_id,
-                                        "درخواست تلاش مجدد؛ انتخاب خودکار بین موتورهای فعال.")
-            admin_render(chat_id, "📥 تلاش مجدد در صف پایدار قرار گرفت؛ هرکدام از سه موتور که فعال باشد انتخاب می‌شود و در صورت قطعی، موضوع در صف می‌ماند.",
+            analytics_queue_task(state, p, operation, user_id,
+                                 "درخواست تلاش مجدد مدیر؛ ادامه از مرحله ثبت‌شده.")
+            admin_render(chat_id, "📥 تلاش مجدد در صف پایدار قرار گرفت؛ " + ("تبدیل مقاله تأییدشده به پست‌ها" if operation == "split" else "تحقیق موضوع") + " از همان مرحله ادامه می‌یابد. لازم نیست موضوع را دوباره بفرستی.",
                          [[admin_button("مشاهده پروژه", "aopen|" + p["id"])], [admin_button("محتوای تحلیلی", "analytics")]], message_id)
         except Exception as exc:
             admin_render(chat_id, "ثبت تلاش مجدد ناموفق بود: " + sanitize_error_text(exc), [[admin_button("بازگشت", "aopen|" + parts[1])]], message_id)
@@ -6824,8 +6905,12 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
             analytics_save(state)
             analytics_open(state, chat_id, p["id"], message_id)
         except Exception as exc:
-            if p: p["status"] = "error"; p["last_error"] = sanitize_error_text(exc); analytics_save(state)
-            admin_render(chat_id, "بازتولید ناموفق بود؛ نسخه‌های قبلی حفظ شده‌اند. " + sanitize_error_text(exc), [[admin_button("پروژه", "aopen|" + parts[1])]], message_id)
+            if p and analytics_try_queue_unavailable(state, p, "split", exc, user_id):
+                p.pop("_ai_runtime", None); analytics_save(state)
+                admin_render(chat_id, "📥 بازتولید در صف پایدار قرار گرفت؛ به‌محض در دسترس بودن یکی از موتورهای فعال، ادامه پیدا می‌کند و نسخه‌های قبلی حفظ می‌شوند.", [[admin_button("پروژه", "aopen|" + parts[1])]], message_id)
+            else:
+                if p: p["status"] = "error"; p["last_error"] = sanitize_error_text(exc); analytics_save(state)
+                admin_render(chat_id, "بازتولید ناموفق بود؛ نسخه‌های قبلی حفظ شده‌اند. " + sanitize_error_text(exc), [[admin_button("پروژه", "aopen|" + parts[1])]], message_id)
     elif action == "apost" and len(parts) > 2:
         analytics_show_post(state, chat_id, parts[1], parts[2], message_id, user_id)
     elif action == "apostapprove" and len(parts) > 1:
@@ -6870,6 +6955,32 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
         if p and post and post.get("status") not in {"published", "sending", "uncertain"}:
             post["status"] = "rejected"; post["scheduled_ts"] = None; p["approved_posts"] = False; p["status"] = "review_posts"; analytics_save(state)
             analytics_show_post(state, chat_id, parts[1], parts[2], message_id, user_id)
+    elif action == "apostdeleteprompt" and len(parts) > 2:
+        p, post = analytics_project_post(state, parts[1], parts[2])
+        if not p or not post:
+            admin_render(chat_id, "پست پیدا نشد.", [[admin_button("بازگشت", "analytics")]], message_id)
+        elif post.get("status") in {"published", "sending", "uncertain"}:
+            admin_render(chat_id, "پست منتشرشده یا دارای نتیجه ارسال نامشخص قابل حذف از سوابق نیست.", [[admin_button("بازگشت به پست", f"apost|{parts[1]}|{parts[2]}")]], message_id)
+        else:
+            admin_render(chat_id, "⚠️ این پست از پروژه حذف می‌شود. نسخه و اطلاعات آن پیش از حذف در تاریخچه پروژه ثبت خواهد شد. ادامه می‌دهی؟",
+                         [[admin_button("تأیید حذف پست", f"apostdeleteconfirm|{parts[1]}|{parts[2]}")],
+                          [admin_button("انصراف", f"apost|{parts[1]}|{parts[2]}")]], message_id)
+    elif action == "apostdeleteconfirm" and len(parts) > 2:
+        p, post = analytics_project_post(state, parts[1], parts[2])
+        if not p or not post or post.get("status") in {"published", "sending", "uncertain"}:
+            admin_render(chat_id, "حذف انجام نشد؛ پست پیدا نشد یا وضعیت آن اجازه حذف نمی‌دهد.", [[admin_button("پروژه", "aopen|" + parts[1])]], message_id)
+        else:
+            p.setdefault("deleted_posts", []).append({"deleted_at": now_ts(), "post": copy.deepcopy(post), "actor": user_id})
+            p["deleted_posts"] = p["deleted_posts"][-50:]
+            p["posts"] = [x for x in p.get("posts", []) if x.get("id") != post.get("id")]
+            for index, remaining in enumerate(p["posts"], 1):
+                remaining["number"] = index
+            p["approved_posts"] = False
+            p["status"] = "review_posts" if p.get("posts") else ("review_research" if p.get("kind") == "research" else "converting")
+            p["updated_at"] = now_ts()
+            analytics_v55._append_history(p, "post_deleted", f"post={post.get('id')}; number={post.get('number')}", user_id)
+            analytics_save(state)
+            analytics_open(state, chat_id, p["id"], message_id)
     elif action == "aimages" and len(parts) > 1:
         p = analytics_v55.ensure_state(state)["projects"].get(parts[1])
         if p:
@@ -7008,6 +7119,17 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
             admin_render(chat_id, "\n\n".join(lines)[:3750], [[admin_button("بازگشت به پست", f"apost|{parts[1]}|{parts[2]}")]], message_id)
     elif action == "asingle" and len(parts) > 2:
         ask_admin_input(state, user_id, chat_id, {"type": "analytics_single_schedule", "project_id": parts[1], "post_id": parts[2]}, "زمان جدید را به وقت منطقه زمانی پروژه با قالب YYYY-MM-DD HH:MM بفرست. تعارض با خبر و تحلیل دیگر بررسی می‌شود؛ زمان‌بندی دستی بدون اطلاع تغییر نمی‌کند.", message_id)
+    elif action == "asinglechoose" and len(parts) > 3:
+        p, post = analytics_project_post(state, parts[1], parts[2])
+        try:
+            if not p or not post: raise RuntimeError("پروژه یا پست پیدا نشد.")
+            tzname = analytics_v55.ensure_state(state)["settings"].get("timezone", "Asia/Tehran")
+            tz = ZoneInfo(tzname) if ZoneInfo else timezone.utc
+            analytics_v55.manual_schedule_single(state, p, post, float(parts[3]), tz)
+            analytics_save(state)
+            analytics_show_post(state, chat_id, p["id"], post["id"], message_id, user_id)
+        except Exception as exc:
+            admin_render(chat_id, "ثبت زمان جایگزین ناموفق بود: " + sanitize_error_text(exc), [[admin_button("بازگشت به پست", f"apost|{parts[1]}|{parts[2]}")]], message_id)
     elif action == "aunschedule" and len(parts) > 2:
         p, post = analytics_project_post(state, parts[1], parts[2])
         if p and post and post.get("status") == "scheduled":
@@ -7189,13 +7311,29 @@ def handle_admin_callback(state, user_id, chat_id, callback, role):
         analytics_v55.ensure_state(state)["settings"]["paused"] = True; analytics_save(state); analytics_menu(state, chat_id, message_id)
     elif action == "aresume":
         analytics_v55.ensure_state(state)["settings"]["paused"] = False; analytics_save(state); analytics_menu(state, chat_id, message_id)
+    elif action == "astyle":
+        analytics_style_menu(state, chat_id, message_id)
+    elif action == "astyleedit":
+        current = str(analytics_v55.ensure_state(state)["settings"].get("custom_writing_instructions", ""))
+        ask_admin_input(state, user_id, chat_id, {"type": "analytics_style_input"},
+                        "دستورالعمل اختصاصی نگارش را کامل بفرست. این متن در تمام مدل‌های تحلیلی اعمال می‌شود. "
+                        f"حداکثر {analytical_style_v591.MAX_CUSTOM_INSTRUCTIONS} نویسه.\n\n" + ("دستور فعلی:\n" + current[:2200] if current else "در حال حاضر دستور اختصاصی ثبت نشده است."), message_id)
+    elif action == "astyleview":
+        preview = analytical_style_v591.build_style_prompt(
+            str(analytics_v55.ensure_state(state)["settings"].get("custom_writing_instructions", "")), "telegram")
+        admin_render(chat_id, "📘 قواعد ثابت نگارش V5.91\n\n" + preview[:3500],
+                     [[admin_button("ویرایش دستور اختصاصی", "astyleedit")], [admin_button("بازگشت", "astyle")]], message_id)
+    elif action == "astyleclear":
+        analytics_v55.ensure_state(state)["settings"]["custom_writing_instructions"] = ""
+        analytics_save(state)
+        analytics_style_menu(state, chat_id, message_id)
     elif action == "asettings":
         a = analytics_v55.ensure_state(state); st = a["settings"]
         queue_count = sum(1 for x in a.get("ai_queue", []) if isinstance(x, dict) and x.get("status") == "queued")
         st["auto_failover"] = True
         st["queue_when_ai_unavailable"] = True
         admin_render(chat_id, f"⚙️ تنظیمات تحلیلی\nمنطقه زمانی: {st.get('timezone')}\nحالت زمان‌بندی: {st.get('schedule_mode')}\nالزام تصویر پیش‌فرض: {st.get('require_image')}\nبازه: {st.get('start_hour')}:00 تا {st.get('end_hour')}:00\nفاصله از خبر: {st.get('min_news_gap_minutes')} دقیقه\nپروژه در روز: {st.get('daily_project_limit',1)}\nپیش‌فرض تعداد پست: {st.get('default_post_count',6)}\nانتخاب خودکار موتور AI: همیشه روشن (Gemini / Groq / Mistral)\nصف پایدار و تلاش مجدد: همیشه روشن | پروژه‌های منتظر: {queue_count}",
-                     [[admin_button("تغییر منطقه زمانی", "atimezone")], [admin_button("تغییر بازه انتشار", "aslot")], [admin_button("تغییر حالت خودکار/دستی", "amode")], [admin_button("تغییر الزام تصویر", "aimagereq")], [admin_button("توقف/ادامه صف انتشار تحلیلی", "apaus" if not st.get("paused") else "aresume")], [admin_button("بازگشت", "analytics")]], message_id)
+                     [[admin_button("تغییر منطقه زمانی", "atimezone")], [admin_button("تغییر بازه انتشار", "aslot")], [admin_button("تغییر حالت خودکار/دستی", "amode")], [admin_button("تغییر الزام تصویر", "aimagereq")], [admin_button("✍️ مدیریت سبک نگارش", "astyle")], [admin_button("توقف/ادامه صف انتشار تحلیلی", "apaus" if not st.get("paused") else "aresume")], [admin_button("بازگشت", "analytics")]], message_id)
     elif action in {"aifailover", "aiqueue"}:
         st = analytics_v55.ensure_state(state)["settings"]
         st["auto_failover"] = True

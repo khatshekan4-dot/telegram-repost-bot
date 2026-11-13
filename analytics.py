@@ -1,4 +1,4 @@
-"""Raptor V5.9 independent analytical-content subsystem.
+"""Raptor V5.91 independent analytical-content subsystem.
 
 All analytics records live under state['_analytics']; news queue/configuration is read-only.
 Analytical research automatically rotates through enabled Gemini, Groq and Mistral providers.
@@ -14,10 +14,13 @@ import os
 import re
 import time
 import uuid
+import ipaddress
+import socket
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote_plus, urlparse
 
 import requests
+import analytical_style as style_engine
 
 log = logging.getLogger("raptor-analytics")
 FOOTER = "\n\n#raptor\n————————\n@khaatshekaan"
@@ -26,7 +29,7 @@ MIN_POSTS = 5
 MAX_POSTS = 6
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 DEFAULT_TZ = "Asia/Tehran"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 class AnalyticsError(RuntimeError):
     """Expected user-facing analytics error."""
@@ -48,6 +51,8 @@ def _default_settings() -> dict:
         "require_image": True, "target_chat_id": os.getenv("ANALYTICS_TARGET_CHAT_ID", os.getenv("TARGET_CHAT_ID", "")).strip(),
         "auto_reschedule": True, "daily_project_limit": 1,
         "default_post_count": 6, "default_tone": "تحلیلی، طبیعی و گفت‌وگومحور",
+        "custom_writing_instructions": "", "style_profile_version": style_engine.STYLE_VERSION,
+        "style_quality_review": True,
         # Analytical research is autonomous by default: all enabled providers are tried,
         # and retryable work is persisted until a provider/search endpoint recovers.
         "auto_failover": True,
@@ -75,6 +80,11 @@ def ensure_state(state: dict) -> dict:
         a["settings"]["queue_when_ai_unavailable"] = True
         a["settings"]["automatic_provider_selection"] = True
     a["settings"].setdefault("automatic_provider_selection", True)
+    a["settings"].setdefault("custom_writing_instructions", "")
+    a["settings"].setdefault("style_profile_version", style_engine.STYLE_VERSION)
+    a["settings"].setdefault("style_quality_review", True)
+    # Never discard manager instructions during migration; only cap oversized payloads.
+    a["settings"]["custom_writing_instructions"] = str(a["settings"].get("custom_writing_instructions", ""))[:style_engine.MAX_CUSTOM_INSTRUCTIONS]
     a.setdefault("history", [])
     a.setdefault("runtime_errors", [])
     a.setdefault("ai_queue", [])
@@ -88,6 +98,7 @@ def ensure_state(state: dict) -> dict:
     for p in a["projects"].values():
         if not isinstance(p, dict):
             continue
+        p.setdefault("target_post_count", int(a["settings"].get("default_post_count", 6) or 6))
         for key, default in {
             "sources": [], "images": [], "posts": [], "errors": [], "versions": [],
             "article_versions": [], "approved_article": False, "approved_posts": False,
@@ -140,6 +151,7 @@ def new_project(state: dict, kind: str, source_text: str, owner_id) -> dict:
         "approved_posts": False, "next_post_index": 0, "publish_day": "", "last_error": "",
         "schedule_mode": "", "archived": False, "paused": False, "history": [], "source_sufficient": None, "ai_provider_override": "gemini",
         "split_note": "", "research_grounding": {},
+        "target_post_count": int(a["settings"].get("default_post_count", 6) or 6),
     }
     a["projects"][pid] = project
     _append_history(project, "created", f"kind={kind}", owner_id)
@@ -295,7 +307,7 @@ def project_ai_call(project: dict, prompt: str, *, use_search=False, timeout=90)
     for provider in candidates:
         try:
             if provider == "gemini":
-                result = gemini_call(prompt, use_search=True, timeout=timeout)
+                result = gemini_call(prompt, use_search=use_search, timeout=timeout)
             else:
                 alternate_prompt = prompt
                 if use_search:
@@ -369,7 +381,7 @@ def _search_url_from_ddg(href: str) -> str:
 def _search_ddg(query: str, limit: int):
     r = requests.get(
         "https://html.duckduckgo.com/html/", params={"q": query},
-        headers={"User-Agent": "Mozilla/5.0 (compatible; RaptorAnalytics/5.9)"}, timeout=18,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; RaptorAnalytics/5.91)"}, timeout=18,
     )
     r.raise_for_status()
     from bs4 import BeautifulSoup
@@ -398,7 +410,7 @@ def _search_bing_rss(query: str, limit: int):
     import xml.etree.ElementTree as ET
     r = requests.get(
         "https://www.bing.com/search", params={"q": query, "format": "rss"},
-        headers={"User-Agent": "Mozilla/5.0 (compatible; RaptorAnalytics/5.9)"}, timeout=18,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; RaptorAnalytics/5.91)"}, timeout=18,
     )
     r.raise_for_status()
     root = ET.fromstring(r.text)
@@ -422,7 +434,7 @@ def _search_wikipedia(query: str, limit: int):
         "https://en.wikipedia.org/w/api.php",
         params={"action": "query", "list": "search", "srsearch": query,
                 "srlimit": min(8, max(1, limit)), "format": "json", "utf8": 1},
-        headers={"User-Agent": "RaptorAnalytics/5.9 (research bot)"}, timeout=15,
+        headers={"User-Agent": "RaptorAnalytics/5.91 (research bot)"}, timeout=15,
     )
     r.raise_for_status()
     rows = r.json().get("query", {}).get("search", [])
@@ -459,7 +471,9 @@ def web_search(query: str, limit=8):
                 seen.add(url)
                 merged.append(item)
                 if len(merged) >= max(1, int(limit)):
-                    return merged
+                    break
+            if len(merged) >= max(1, int(limit)):
+                break
         except Exception as exc:
             errors.append(f"{label}: {type(exc).__name__}")
             log.warning("Analytics search provider %s unavailable: %s", label, type(exc).__name__)
@@ -469,7 +483,78 @@ def web_search(query: str, limit=8):
             f"جست‌وجوی وب فعلاً کمتر از ۳ نتیجه معتبر پیدا کرد ({len(merged)} نتیجه). "
             f"پروژه در صف می‌ماند و خودکار دوباره تلاش می‌شود. {detail}"
         )
-    return merged
+    # Search snippets alone are not enough for a technical research article.
+    # Fetch a bounded amount of public page text for each result where possible.
+    return _enrich_search_results(merged[:max(1, int(limit))])
+
+
+def _public_http_url(url: str) -> bool:
+    """Conservative public-web URL check to avoid fetching local/private targets."""
+    parsed = urlparse(str(url or ""))
+    if parsed.scheme != "https" or not parsed.hostname:
+        return False
+    host = parsed.hostname.lower().rstrip(".")
+    if host in {"localhost", "metadata.google.internal"} or host.endswith((".local", ".internal", ".localhost")):
+        return False
+    try:
+        addresses = {row[4][0] for row in socket.getaddrinfo(host, parsed.port or 443, type=socket.SOCK_STREAM)}
+        return bool(addresses) and all(ipaddress.ip_address(addr).is_global for addr in addresses)
+    except Exception:
+        return False
+
+
+def _fetch_public_page(url: str, timeout=12) -> tuple[str, str]:
+    if not _public_http_url(url):
+        return "", "not_fetched_nonpublic_or_unverified"
+    try:
+        # Redirects are deliberately disabled; every fetched host must be verified first.
+        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; RaptorResearch/5.91)"},
+                                timeout=timeout, allow_redirects=False, stream=True)
+        if response.status_code in {301, 302, 303, 307, 308}:
+            response.close()
+            return "", "redirect_not_followed"
+        if response.status_code != 200:
+            status = f"http_{response.status_code}"
+            response.close()
+            return "", status
+        content_type = str(response.headers.get("Content-Type", "")).lower()
+        if not any(x in content_type for x in ("text/html", "application/xhtml+xml", "text/plain")):
+            response.close()
+            return "", "non_html_content"
+        payload = response.raw.read(1_500_000, decode_content=True)
+        response.close()
+        if "text/plain" in content_type:
+            return payload.decode("utf-8", errors="replace")[:6000], "ok_text"
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(payload, "html.parser")
+        for node in soup.select("script,style,noscript,nav,header,footer,aside,form,svg,button,iframe"):
+            node.decompose()
+        title = soup.title.get_text(" ", strip=True) if soup.title else ""
+        main = soup.find("article") or soup.find("main") or soup.body or soup
+        paragraphs = [node.get_text(" ", strip=True) for node in main.select("p")]
+        paragraphs = [re.sub(r"\s+", " ", item) for item in paragraphs if len(item) >= 45]
+        text = "\n".join(paragraphs)
+        if len(text) < 180:
+            text = main.get_text(" ", strip=True)
+        text = re.sub(r"\s+", " ", text).strip()[:6000]
+        return (("TITLE: " + title + "\n" if title else "") + text, "ok_html" if len(text) >= 180 else "short_page")
+    except Exception as exc:
+        return "", "fetch_error:" + type(exc).__name__
+
+
+def _enrich_search_results(results: list[dict], max_pages=6) -> list[dict]:
+    enriched = []
+    for index, item in enumerate(results):
+        record = dict(item)
+        if index < max_pages:
+            content, status = _fetch_public_page(str(record.get("url", "")))
+        else:
+            content, status = "", "snippet_only_limit"
+        record["content_excerpt"] = content
+        record["fetch_status"] = status
+        record["fetched_at"] = now_ts() if content else None
+        enriched.append(record)
+    return enriched
 
 
 def _split_article_sources(text: str):
@@ -493,13 +578,23 @@ def research_project(project: dict):
         raise AnalyticsError(f"جست‌وجوی وب فقط {len(results)} نتیجه قابل استفاده داد؛ حداقل ۳ نتیجه لازم است تا تحقیق ضعیف به مقاله تبدیل نشود.")
     sources = [{"title": x["title"], "url": x["url"], "snippet": x["snippet"],
                 "retrieved_at": x.get("retrieved_at", now_ts()), "status": "needs_review",
-                "search_provider": x.get("search_provider", "unknown")} for x in results]
-    evidence = "\n\n".join(f"[{i+1}] {s['title']}\nURL: {s['url']}\nخلاصه نتیجه: {s['snippet']}" for i, s in enumerate(sources))
+                "search_provider": x.get("search_provider", "unknown"),
+                "content_excerpt": x.get("content_excerpt", ""),
+                "fetch_status": x.get("fetch_status", "snippet_only"),
+                "fetched_at": x.get("fetched_at")} for x in results]
+    evidence = "\n\n".join(
+        f"[{i+1}] {s['title']}\nURL: {s['url']}\nخلاصه جست‌وجو: {s['snippet']}\n"
+        f"وضعیت دریافت صفحه: {s.get('fetch_status', 'snippet_only')}\nمتن استخراج‌شده از صفحه: {s.get('content_excerpt') or 'متن کامل صفحه دریافت نشد؛ فقط خلاصه جست‌وجو موجود است.'}"
+        for i, s in enumerate(sources))
+    custom_style = str(project.get("_style_custom_instructions", ""))
     prompt = (
-        "نقش: پژوهشگر و نویسنده فارسی‌زبان. از نتایج جست‌وجوی واقعی پیوست و در صورت نیاز Google Search grounding استفاده کن. "
+        style_engine.build_style_prompt(custom_style, "research")
+        + "\n\nنقش: پژوهشگر و نویسنده فارسی‌زبان. از نتایج جست‌وجوی واقعی پیوست و در صورت نیاز Google Search grounding استفاده کن. "
         "منابع را در گزارش مدیریتی جدا کن؛ نام منابع/مستندات، فهرست منبع و هیچ URL را داخل ARTICLE نیاور و فقط در SOURCES ثبت کن. "
         "هیچ عدد، تاریخ، منبع یا پیوندی جعل نکن. گزارش منابع را جای مقاله نگذار. "
-        "نتایج جست‌وجو ممکن است فقط عنوان و خلاصه باشند؛ جزئیات فاقد پشتوانه را قطعی ننویس و برای مشخصات حساس چندمنبعی بودن را بررسی کن. "
+        "برای هر منبع، عنوان و خلاصه جست‌وجو و در صورت موفقیت متن استخراج‌شده از صفحه واقعی پیوست شده است. "
+        "در مواردی که متن صفحه دریافت نشده، فقط به همان خلاصه محدود بمان و وانمود نکن کل سند را خوانده‌ای. "
+        "ادعاهای فنی مهم را با چند منبع مستقل موجود تطبیق بده؛ اگر پشتوانه چندمنبعی وجود ندارد، آن را قطعی ننویس. "
         "میان داده تأییدشده، گزارش تأییدنشده، برآورد/تحلیل، اختلاف منابع و اطلاعات ناکافی تمایز بگذار. "
         "مشخصات نسخه‌های مختلف تجهیزات را مخلوط نکن. تاریخ انتشار منبع و تاریخ رویداد را در صورت وجود تفکیک کن. "
         "اگر شواهد کافی نیست، آن محدودیت را در متن مدیریتی و نه در ادعای قطعی توضیح بده. "
@@ -580,14 +675,17 @@ def _clean_body(text: str) -> str:
 
 
 def _footer_text(text: str) -> str:
-    body = _clean_body(text)
+    # Enforce the user's terminology preferences consistently across all providers.
+    body = style_engine.normalize_terminology(_clean_body(text))
     return (body + FOOTER).strip() if body else ""
 
 
 def _call_split_model(project: dict, source: str, target_count: int, tone: str, strict: bool):
     char_cap = 900 if strict else 925
+    custom_style = str(project.get("_style_custom_instructions", ""))
     prompt = (
-        "متن زیر را به پست‌های مستقل اما پیوسته فارسی تلگرام تبدیل کن. خروجی فقط JSON معتبر باشد: "
+        style_engine.build_style_prompt(custom_style, "telegram")
+        + "\n\nمتن زیر را به پست‌های مستقل اما پیوسته فارسی تلگرام تبدیل کن. خروجی فقط JSON معتبر باشد: "
         '{"posts":[{"title":"...","text":"...","image_query":"..."}],"note":"...","source_sufficient":true}. '
         f"هدف ۵ تا ۶ پست است؛ سقف خروجی حداکثر {MAX_POSTS} پست. تعداد هدف {target_count}. "
         "فقط اگر منبع برای ۵ پست محتوای متمایز کافی ندارد کمتر تولید کن و علت را در note توضیح بده. "
@@ -608,13 +706,65 @@ def _call_split_model(project: dict, source: str, target_count: int, tone: str, 
     return obj, posts
 
 
+def _quality_review_candidate_posts(project: dict, source: str, posts: list[dict]) -> list[dict]:
+    """Run an independent style/content review and one repair pass when needed."""
+    settings = project.get("_style_quality_review", True)
+    if not settings:
+        return posts
+    custom_style = str(project.get("_style_custom_instructions", ""))
+    prompt = style_engine.build_quality_review_prompt(posts, source, custom_style)
+    response, _ = project_ai_call(project, prompt)
+    review = _json_from_model(response)
+    if review.get("compliant") is True:
+        reviewed = posts
+    else:
+        raw_revised = review.get("posts")
+        if not isinstance(raw_revised, list) or not 1 <= len(raw_revised) <= MAX_POSTS:
+            raise AnalyticsError("بازبینی سبک، ایرادهایی پیدا کرد اما نسخه اصلاح‌شده معتبر برنگرداند.")
+        reviewed = []
+        for i, item in enumerate(raw_revised, 1):
+            if not isinstance(item, dict):
+                raise AnalyticsError(f"پست اصلاح‌شده شماره {i} ساختار معتبری ندارد.")
+            old = posts[i-1] if i <= len(posts) else {}
+            body = _clean_body(item.get("text", ""))
+            text = _footer_text(body)
+            if not body:
+                raise AnalyticsError(f"متن اصلاح‌شده پست {i} خالی است.")
+            reviewed.append({
+                **old,
+                "id": old.get("id") or uuid.uuid4().hex[:12],
+                "number": i,
+                "title": str(item.get("title") or old.get("title") or f"بخش {i}")[:140],
+                "text": text, "char_count": len(text),
+                "image_query": str(item.get("image_query") or old.get("image_query") or project.get("title", ""))[:240],
+                "images": copy.deepcopy(old.get("images", [])),
+                "image_candidates": copy.deepcopy(old.get("image_candidates", [])),
+                "status": "draft", "scheduled_ts": None, "telegram_message_id": None,
+                "updated_at": now_ts(), "style_validation_version": style_engine.STYLE_VERSION,
+            })
+    issues = []
+    for i, post in enumerate(reviewed, 1):
+        body = _clean_body(post.get("text", ""))
+        for issue in style_engine.style_issues(body):
+            issues.append(f"پست {i}: {issue}")
+        post["style_validation_version"] = style_engine.STYLE_VERSION
+        post["text"] = _footer_text(body)
+        post["char_count"] = len(post["text"])
+    if issues:
+        raise AnalyticsError("کنترل نهایی سبک پس از اصلاح همچنان ناموفق است: " + "؛ ".join(issues[:8]))
+    validation = validate_post_set(reviewed, require_images=False)
+    if validation:
+        raise AnalyticsError("خروجی اصلاح‌شده از اعتبارسنجی پایتون عبور نکرد: " + "؛ ".join(validation[:8]))
+    return reviewed
+
+
 def split_into_posts(project: dict, count=None, tone=None):
     source = (project.get("article") or project.get("source_text") or "").strip()
     if not source:
         raise AnalyticsError("مقاله یا متن ورودی موجود نیست.")
-    target_count = max(MIN_POSTS, min(MAX_POSTS, int(count or MAX_POSTS)))
+    target_count = max(MIN_POSTS, min(MAX_POSTS, int(count or project.get("target_post_count") or MAX_POSTS)))
     tone = tone or os.getenv("ANALYTICS_DEFAULT_TONE", "تحلیلی، طبیعی و گفت‌وگومحور")
-    # First model attempt. If post validation fails, ask Gemini to repair before rejecting.
+    # First model attempt. Validation and style repair use the project's currently routed provider.
     last_error = ""
     for attempt in range(3):
         try:
@@ -639,9 +789,19 @@ def split_into_posts(project: dict, count=None, tone=None):
                     "images": [], "image_candidates": [], "status": "draft", "scheduled_ts": None,
                     "telegram_message_id": None, "created_at": now_ts(), "updated_at": now_ts(),
                     "attempts": [], "versions": [], "last_error": "", "manual_schedule": False,
+                    "style_validation_version": style_engine.STYLE_VERSION,
                 })
             if not candidate_posts:
                 raise AnalyticsError("هیچ پست غیرخالی تولید نشد.")
+            candidate_posts = _quality_review_candidate_posts(project, source, candidate_posts)
+            source_sufficient = obj.get("source_sufficient")
+            if len(candidate_posts) > target_count:
+                raise AnalyticsError(f"تعداد پست‌ها از هدف انتخاب‌شده یعنی {target_count} بیشتر است؛ خروجی پذیرفته نشد.")
+            if len(candidate_posts) < target_count and source_sufficient is not False:
+                raise AnalyticsError(
+                    f"مدل کمتر از تعداد هدف یعنی {target_count} پست تولید کرد اما صراحتاً کمبود محتوای منبع را اعلام نکرد؛ "
+                    "خروجی برای جلوگیری از تحویل ناقص پذیرفته نشد."
+                )
             validation = validate_post_set(candidate_posts, require_images=False)
             if validation:
                 raise AnalyticsError("اعتبارسنجی مستقل پست‌ها ناموفق بود: " + "; ".join(validation[:4]))
@@ -672,7 +832,7 @@ def split_into_posts(project: dict, count=None, tone=None):
 
 def _commons_search_once(query: str, limit: int):
     """Search Commons file namespace and resolve real imageinfo URLs."""
-    headers = {"User-Agent": "RaptorAnalytics/5.9 (Telegram analytical content bot)"}
+    headers = {"User-Agent": "RaptorAnalytics/5.91 (Telegram analytical content bot)"}
     search = requests.get("https://commons.wikimedia.org/w/api.php", params={
         "action": "query", "list": "search", "srsearch": f"filetype:bitmap {query}",
         "srnamespace": 6, "srlimit": min(10, max(1, int(limit))), "format": "json",
@@ -804,6 +964,9 @@ def validate_post_set(posts, require_images=True):
         seen.add(body_norm)
         if not text.endswith(FOOTER): errors.append(f"پست {i} footer اجباری را ندارد.")
         if not post.get("title"): errors.append(f"عنوان پست {i} خالی است.")
+        if post.get("style_validation_version") == style_engine.STYLE_VERSION:
+            for issue in style_engine.style_issues(_clean_body(text)):
+                errors.append(f"پست {i}: {issue}")
         post["number"] = i
         post["char_count"] = len(text)
     return errors
@@ -812,7 +975,7 @@ def validate_post_set(posts, require_images=True):
 def validate_project_posts(project: dict, require_images=True):
     errors = validate_post_set(project.get("posts", []), require_images=require_images)
     # Fewer than five is acceptable only when the model explicitly noted insufficient source material.
-    if len(project.get("posts", [])) < MIN_POSTS and not project.get("source_sufficient") is False:
+    if len(project.get("posts", [])) < MIN_POSTS and project.get("source_sufficient") is not False:
         errors.append("برای مقاله کامل ۵ تا ۶ پست هدف است؛ تعداد کمتر فقط با ثبت کمبود محتوای منبع پذیرفته می‌شود.")
     return errors
 
@@ -853,7 +1016,8 @@ def rewrite_post(project: dict, post_id: str, instruction: str, actor=None):
     if post.get("status") in {"published", "sending", "uncertain"}:
         raise AnalyticsError("پست منتشرشده یا با نتیجه نامشخص قابل بازنویسی در صف نیست.")
     prompt = (
-        "فقط پست زیر را مطابق دستور مدیر بازنویسی کن. از منابع متن پروژه فراتر نرو؛ هیچ واقعیت/عدد/تاریخی نساز. "
+        style_engine.build_style_prompt(str(project.get("_style_custom_instructions", "")), "telegram")
+        + "\n\nفقط پست زیر را مطابق دستور مدیر بازنویسی کن. از منابع متن پروژه فراتر نرو؛ هیچ واقعیت/عدد/تاریخی نساز. "
         "متن فارسی تلگرامی، طبیعی و مستقل باشد؛ در خروجی فقط متن پست را بده، بدون توضیح داخلی و بدون footer. "
         "حداکثر ۹۰۰ نویسه پیش از footer.\nدستور مدیر: " + instruction +
         "\nعنوان: " + str(post.get("title", "")) + "\nمتن فعلی:\n" + _clean_body(post.get("text", "")) +
@@ -863,8 +1027,22 @@ def rewrite_post(project: dict, post_id: str, instruction: str, actor=None):
     candidate = _footer_text(response)
     if not candidate or len(candidate) > MAX_POST_CHARS or len(candidate.encode("utf-16-le")) // 2 > 1024:
         raise AnalyticsError("خروجی بازنویسی از اعتبارسنجی مستقل عبور نکرد؛ نسخه قبلی حفظ شد.")
+    if project.get("_style_quality_review", True):
+        reviewed = _quality_review_candidate_posts(
+            project,
+            str(project.get("article") or project.get("source_text") or "")[:18000],
+            [{**copy.deepcopy(post), "text": candidate, "char_count": len(candidate), "status": "draft"}],
+        )
+        candidate = reviewed[0]["text"]
+    else:
+        style_errors = style_engine.style_issues(_clean_body(candidate))
+        if style_errors:
+            raise AnalyticsError("خروجی بازنویسی با قواعد سبک سازگار نیست: " + "؛ ".join(style_errors[:5]))
+    if not candidate or len(candidate) > MAX_POST_CHARS or len(candidate.encode("utf-16-le")) // 2 > 1024:
+        raise AnalyticsError("خروجی بازنویسی پس از کنترل کیفیت از اعتبارسنجی مستقل عبور نکرد؛ نسخه قبلی حفظ شد.")
     snapshot_post(post, "before_ai_rewrite:" + instruction[:60], actor)
     post["text"] = candidate
+    post["style_validation_version"] = style_engine.STYLE_VERSION
     post["status"] = "needs_review"
     post["scheduled_ts"] = None
     post["manual_schedule"] = False
@@ -940,15 +1118,20 @@ def reorder_post_images(project: dict, post_id: str, order):
 
 
 def research_addendum(project: dict, request_text: str):
-    if project.get("kind") != "research": raise AnalyticsError("این قابلیت فقط برای پروژه تحقیق Gemini است.")
+    if project.get("kind") != "research": raise AnalyticsError("این قابلیت فقط برای پروژه‌های تحقیق از موضوع است.")
     query = (request_text or project.get("topic", "")).strip()
     results = web_search(query + " official updated report technical historical", 6)
     if not results: raise AnalyticsError("جست‌وجوی تکمیلی نتیجه‌ای نداد؛ مقاله قبلی حفظ شد.")
-    evidence = "\n\n".join(f"[{i+1}] {x['title']}\nURL: {x['url']}\n{x['snippet']}" for i, x in enumerate(results))
-    prompt = ("مقاله موجود را با شواهد تازه زیر تکمیل کن. متن قبلی را پاک نکن مگر آنکه دقیقاً اصلاح شود. "
+    evidence = "\n\n".join(
+        f"[{i+1}] {x['title']}\nURL: {x['url']}\nخلاصه جست‌وجو: {x.get('snippet','')}\n"
+        f"وضعیت دریافت صفحه: {x.get('fetch_status','snippet_only')}\n"
+        f"متن استخراج‌شده: {x.get('content_excerpt') or 'متن صفحه دریافت نشد؛ صرفاً خلاصه جست‌وجو موجود است.'}"
+        for i, x in enumerate(results))
+    prompt = (style_engine.build_style_prompt(str(project.get("_style_custom_instructions", "")), "research")
+              + "\n\nمقاله موجود را با شواهد تازه زیر تکمیل کن. متن قبلی را پاک نکن مگر آنکه دقیقاً اصلاح شود. "
               "ادعاهای جدید را از تحلیل/برآورد جدا کن و چیزی نساز. فقط ARTICLE و SOURCES بده. "
               f"\nدرخواست مدیر: {request_text}\nمقاله فعلی:\n{project.get('article','')}\nشواهد جدید:\n{evidence}")
-    response, raw = project_ai_call(project, prompt, use_search=(project.get("ai_provider_override") or "gemini") == "gemini")
+    response, raw = project_ai_call(project, prompt, use_search=True)
     article = _split_article_sources(response)
     if len(article) < 100: raise AnalyticsError("تحقیق تکمیلی خروجی قابل استفاده نداشت؛ مقاله قبلی حفظ شد.")
     project.setdefault("article_versions", []).append({"at": now_ts(), "article": project.get("article", ""), "action": "before_addendum"})
@@ -962,8 +1145,12 @@ def research_addendum(project: dict, request_text: str):
             old_post["scheduled_ts"] = None
             old_post["manual_schedule"] = False
     existing = {x.get("url") for x in project.get("sources", [])}
-    project.setdefault("sources", []).extend({"title": x["title"], "url": x["url"], "snippet": x["snippet"], "retrieved_at": now_ts(), "status": "needs_review"}
-                                                for x in results if x.get("url") not in existing)
+    project.setdefault("sources", []).extend({
+        "title": x["title"], "url": x["url"], "snippet": x.get("snippet", ""),
+        "content_excerpt": x.get("content_excerpt", ""), "fetch_status": x.get("fetch_status", "snippet_only"),
+        "search_provider": x.get("search_provider", "unknown"),
+        "fetched_at": x.get("fetched_at"), "retrieved_at": now_ts(), "status": "needs_review"
+    } for x in results if x.get("url") not in existing)
     project["approved_article"] = False
     project["status"] = "review_research"
     _append_history(project, "research_updated", request_text[:160])
@@ -1142,6 +1329,48 @@ def propose_project_schedule(state: dict, project: dict, tzinfo):
             _append_history(project, "schedule_auto", day_key + f"; posts={len(active_posts)}")
             return candidates
     raise AnalyticsError("در ۳۶۵ روز آینده زمان خالی مطابق محدودیت‌ها پیدا نشد؛ صف تحلیلی حفظ شد و صف اخبار تغییر نکرد.")
+
+def suggest_manual_schedule_times(state: dict, project: dict, post: dict, around_ts: float,
+                                   tzinfo, limit: int = 5, days: int = 7) -> list[float]:
+    """Find nearby valid alternatives by running the exact manual-schedule validator on copies."""
+    if not project or not post:
+        return []
+    anchor = datetime.fromtimestamp(float(around_ts), tzinfo)
+    start_hour = int(ensure_state(state)["settings"].get("start_hour", 14))
+    end_hour = int(ensure_state(state)["settings"].get("end_hour", 21))
+    start_day = anchor.date()
+    candidates = []
+    for day_offset in range(0, max(1, min(14, int(days)))):
+        day = start_day + timedelta(days=day_offset)
+        for hour in range(start_hour, end_hour + 1):
+            for minute in (0, 15, 30, 45):
+                if hour == end_hour and minute:
+                    continue
+                dt = datetime(day.year, day.month, day.day, hour, minute, tzinfo=tzinfo)
+                stamp = dt.timestamp()
+                if stamp <= now_ts() + 60:
+                    continue
+                if day_offset == 0 and abs(stamp - float(around_ts)) < 15 * 60:
+                    continue
+                candidates.append(stamp)
+    candidates.sort(key=lambda ts: (abs(ts - float(around_ts)), ts))
+    valid = []
+    for stamp in candidates:
+        clone = copy.deepcopy(state)
+        clone_a = ensure_state(clone)
+        clone_project = clone_a["projects"].get(str(project.get("id")))
+        clone_post = find_post(clone_project, str(post.get("id"))) if clone_project else None
+        if not clone_project or not clone_post:
+            continue
+        try:
+            manual_schedule_single(clone, clone_project, clone_post, stamp, tzinfo)
+            valid.append(stamp)
+            if len(valid) >= max(1, min(8, int(limit))):
+                break
+        except AnalyticsError:
+            continue
+    return sorted(valid)
+
 
 def propose_manual_schedule(state: dict, project: dict, timestamps, tzinfo):
     """Validate all manual timestamps atomically before mutating project posts."""
